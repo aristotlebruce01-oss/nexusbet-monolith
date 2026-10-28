@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Local SQLite databases
+*.db
+
+# Uploads directory (keeps the folder structure in Git if needed, but ignores uploaded proofs)
+uploads/*
+!uploads/.gitkeep
