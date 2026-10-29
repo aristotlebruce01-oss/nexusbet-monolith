@@ -1536,6 +1536,8 @@ async def update_staff(user_id: str, body: StaffUpdateInput, manager: dict = Dep
         raise HTTPException(status_code=404, detail="Staff account not found")
     if target.get("role") == "super_admin" and manager.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Admins cannot modify Super Admin accounts")
+    if manager.get("role") == "admin" and target.get("role") != "sub_admin":
+        raise HTTPException(status_code=403, detail="Admins can only edit Sub-Admin accounts")
     values = {}
     for key in ("name", "email", "phone"):
         value = getattr(body, key, None)
@@ -1659,7 +1661,7 @@ async def admin_transactions(status: Optional[str] = None, transaction_type: Opt
 
 @router.post("/admin/transactions/{transaction_id}/review")
 async def review_transaction(transaction_id: str, action: Literal["approve", "reject"],
-                             reason: str = "", staff: dict = Depends(require_admin)):
+                             reason: str = "", staff: dict = Depends(require_permission("transactions.review"))):
     txn = await db.transactions.find_one({"id": transaction_id})
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -1788,6 +1790,8 @@ async def set_user_role(user_id: str, body: RoleInput, admin: dict = Depends(req
         raise HTTPException(status_code=404, detail="User not found")
     if target.get("role") == "super_admin":
         raise HTTPException(status_code=403, detail="Super Admin accounts cannot be modified")
+    if admin.get("role") == "sub_admin" and (target.get("role") in STAFF_ROLES or body.role in ("admin", "sub_admin")):
+        raise HTTPException(status_code=403, detail="Sub-Admins cannot assign or modify staff roles")
     if admin.get("role") == "admin" and target.get("role") == "admin":
         raise HTTPException(status_code=403, detail="Admins cannot modify or demote Admin accounts")
     if admin.get("role") == "admin" and body.role == "admin":
