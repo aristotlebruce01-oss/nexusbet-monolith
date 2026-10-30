@@ -266,25 +266,50 @@ async def unique_code(collection, field: str, n: int = 8) -> str:
 
 @router.get("/odds")
 def get_live_sports_odds():
-    """Return sanitized upcoming fixtures and head-to-head odds from The Odds API."""
+    """Fetch real bookmaker odds for configured football, basketball and tennis feeds."""
     api_key = os.getenv("ODDS_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="Sports odds provider is not configured (ODDS_API_KEY missing).")
-    url = "https://api.the-odds-api.com/v4/sports/upcoming/odds"
-    params = {"apiKey": api_key, "regions": os.getenv("ODDS_REGIONS", "uk,us,au"),
-              "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso"}
-    try:
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        logging.warning("Odds provider request failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Unable to fetch live sports odds right now.")
-    except ValueError:
-        raise HTTPException(status_code=502, detail="Odds provider returned an invalid response.")
+    sport_keys = [x.strip() for x in os.getenv(
+        "ODDS_SPORT_KEYS",
+        "soccer_epl,soccer_uefa_champs_league,basketball_nba,tennis_atp_french_open"
+    ).split(",") if x.strip()]
+    payload_events = []
+    successful_feeds = 0
+    failures = []
+    for sport_key in sport_keys[:8]:
+        try:
+            response = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                params={"apiKey": api_key, "regions": os.getenv("ODDS_REGIONS", "uk,us,au"),
+                        "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso"},
+                timeout=15,
+            )
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list):
+                successful_feeds += 1
+                payload_events.extend(payload)
+        except requests.RequestException as exc:
+            logging.warning("Odds provider request failed for %s: %s", sport_key, exc)
+            failures.append(sport_key)
+        except ValueError:
+            failures.append(sport_key)
+    if successful_feeds == 0:
+        detail = "Unable to fetch odds from the configured sports feeds."
+        if failures:
+            detail = "The configured odds provider feeds are unavailable. Check ODDS_API_KEY and ODDS_SPORT_KEYS."
+        raise HTTPException(status_code=502, detail=detail)
 
     matches = []
-    for event in payload if isinstance(payload, list) else []:
+    seen_ids = set()
+    for event in payload_events:
+        event_id = event.get("id")
+        if not event_id or event_id in seen_ids:
+            continue
+        seen_ids.add(event_id)
         bookmakers = []
         for bookmaker in event.get("bookmakers", []) or []:
             markets = []
@@ -299,11 +324,61 @@ def get_live_sports_odds():
             if markets:
                 bookmakers.append({"key": bookmaker.get("key"), "title": bookmaker.get("title"),
                                    "last_update": bookmaker.get("last_update"), "markets": markets})
-        matches.append({"id": event.get("id"), "sport_key": event.get("sport_key"),
+        matches.append({"id": event_id, "sport_key": event.get("sport_key"),
                         "sport_title": event.get("sport_title"), "commence_time": event.get("commence_time"),
                         "home_team": event.get("home_team"), "away_team": event.get("away_team"),
                         "bookmakers": bookmakers})
-    return {"matches": matches, "count": len(matches)}
+    return {"matches": matches, "count": len(matches), "source": "The Odds API"}
+
+
+@router.get("/live-scores")
+def get_live_sports_scores():
+    """Fetch current score data from The Odds API for configured sport keys."""
+    api_key = os.getenv("ODDS_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Live sports provider is not configured (ODDS_API_KEY missing).")
+    sport_keys = [x.strip() for x in os.getenv(
+        "ODDS_LIVE_SPORT_KEYS",
+        "soccer_epl,soccer_uefa_champs_league,basketball_nba,tennis_atp_french_open"
+    ).split(",") if x.strip()]
+    live_matches = []
+    failures = []
+    for sport_key in sport_keys[:8]:
+        try:
+            response = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores",
+                params={"apiKey": api_key, "daysFrom": 1, "dateFormat": "iso"},
+                timeout=12,
+            )
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            for event in payload if isinstance(payload, list) else []:
+                scores = event.get("scores") or []
+                # Provider scores are only treated as live when not marked completed.
+                if event.get("completed") is True or not scores:
+                    continue
+                score_map = {str(item.get("name", "")): item.get("score") for item in scores}
+                live_matches.append({
+                    "id": event.get("id"), "sport_key": event.get("sport_key", sport_key),
+                    "sport_title": event.get("sport_title", sport_key),
+                    "home_team": event.get("home_team"), "away_team": event.get("away_team"),
+                    "commence_time": event.get("commence_time"), "scores": scores,
+                    "home_score": score_map.get(str(event.get("home_team", ""))),
+                    "away_score": score_map.get(str(event.get("away_team", ""))),
+                    "completed": bool(event.get("completed", False)),
+                    "last_update": event.get("last_update"),
+                })
+        except requests.RequestException as exc:
+            logging.warning("Live scores provider request failed for %s: %s", sport_key, exc)
+            failures.append(sport_key)
+        except ValueError:
+            failures.append(sport_key)
+    if failures and not live_matches and len(failures) == min(len(sport_keys), 8):
+        raise HTTPException(status_code=502, detail="Unable to fetch live scores from the configured sports provider.")
+    return {"matches": live_matches, "count": len(live_matches), "source": "The Odds API"}
+
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -494,12 +569,12 @@ class EventInput(BaseModel):
     home: str = Field(min_length=1, max_length=80)
     away: str = Field(min_length=1, max_length=80)
     odds_home: float = Field(gt=1.0, le=1000)
-    odds_draw: float = Field(gt=1.0, le=1000)
+    odds_draw: Optional[float] = Field(default=None, gt=1.0, le=1000)
     odds_away: float = Field(gt=1.0, le=1000)
     kickoff_at: Optional[datetime] = None
 
 class EventControlInput(BaseModel):
-    status: Optional[Literal["open", "live", "finished", "cancelled"]] = None
+    status: Optional[Literal["open", "live", "paused", "finished", "cancelled"]] = None
     minute: Optional[int] = Field(default=None, ge=0, le=120)
     home_score: Optional[int] = Field(default=None, ge=0, le=99)
     away_score: Optional[int] = Field(default=None, ge=0, le=99)
@@ -672,7 +747,7 @@ async def list_virtual_matches(status: Optional[str] = None, limit: int = 200, s
     for doc in docs:
         # Simulated virtual matches occasionally score while live. The next goal
         # timestamp is persisted so polling frequency cannot cause rapid scoring.
-        if doc.get("status") == "live":
+        if doc.get("status") == "live" and not doc.get("score_controlled", False):
             now_dt = datetime.now(timezone.utc)
             next_goal = doc.get("next_virtual_goal_at")
             try:
@@ -751,9 +826,20 @@ async def control_virtual_match(match_id: str, body: VirtualControlInput, staff:
     current = await db.events.find_one({"id": match_id, "sport": "Virtual Football"})
     if not current: raise HTTPException(status_code=404, detail="Virtual match not found")
     values = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    # Once staff manually changes either score, stop the simulated goal generator
+    # so all future score changes are under explicit Admin control.
+    if "home_score" in values or "away_score" in values:
+        values["score_controlled"] = True
     if values.get("status") == "live" and current.get("status") != "live":
-        values["clock_started_at"] = datetime.now(timezone.utc).isoformat(); values["clock_base_minute"] = values.get("minute", current.get("minute", 0)); values["next_virtual_goal_at"] = (datetime.now(timezone.utc) + timedelta(seconds=random.randint(18, 55))).isoformat()
-    if values.get("status") in ("paused", "halftime", "finished", "cancelled"): values["clock_started_at"] = None
+        base_minute = int(values.get("minute", virtual_minute(current) if current.get("status") in ("paused", "halftime") else current.get("minute", 0)))
+        values["minute"] = base_minute
+        values["clock_started_at"] = datetime.now(timezone.utc).isoformat()
+        values["clock_base_minute"] = base_minute
+        values["next_virtual_goal_at"] = (datetime.now(timezone.utc) + timedelta(seconds=random.randint(18, 55))).isoformat()
+    if values.get("status") in ("paused", "halftime", "finished", "cancelled"):
+        values["minute"] = virtual_minute(current)
+        values["clock_base_minute"] = values["minute"]
+        values["clock_started_at"] = None
     await db.events.update_one({"id": match_id}, {"$set": values})
     updated = await db.events.find_one({"id": match_id})
     if values.get("status") == "finished":
@@ -791,13 +877,18 @@ CORRECT_SCORE_ODDS = {
 }
 
 def selection_odds(event: dict, selection: str) -> float:
+    sport = str(event.get("sport", "Football")).strip().lower()
     if selection not in {"home", "draw", "away"}:
         raise HTTPException(status_code=400, detail="Selection must be home, draw, or away")
+    if sport in {"basketball", "tennis"} and selection == "draw":
+        raise HTTPException(status_code=400, detail=f"Draw odds are not available for {sport.title()}; choose a winner.")
     defaults = {"home": 1.85, "draw": 3.40, "away": 3.75}
     raw = {"home": event.get("odds_home"), "draw": event.get("odds_draw"), "away": event.get("odds_away")}[selection]
     try:
         value = float(raw)
     except (TypeError, ValueError):
+        if sport in {"basketball", "tennis"} and selection == "draw":
+            raise HTTPException(status_code=400, detail="Draw odds are unavailable for this sport")
         value = defaults[selection]
     return value if value > 0 else defaults[selection]
 
@@ -944,10 +1035,17 @@ async def control_event(event_id: str, body: EventControlInput, staff: dict = De
     # Start Live always starts a fresh 94-minute real-time clock. Score changes
     # made by Admin before/while live are preserved.
     if requested_status == "live":
-        values["minute"] = 1
-        values["clock_base_minute"] = 1
+        # Resume from a paused minute; a fresh match starts at minute 1.
+        resume_minute = int(current.get("minute", 0) or 0) if current.get("status") == "paused" else 1
+        values["minute"] = max(1, min(94, resume_minute))
+        values["clock_base_minute"] = values["minute"]
         values["clock_started_at"] = datetime.now(timezone.utc).isoformat()
         values.pop("result", None)
+
+    if requested_status == "paused":
+        values["minute"] = live_event_minute(current)
+        values["clock_base_minute"] = values["minute"]
+        values["clock_started_at"] = None
 
     # Finish Match freezes the event at 94 minutes and settles every ticket
     # leg against the exact score currently stored on the event.
@@ -1123,7 +1221,7 @@ async def verify_ticket_status(body: TicketVerifyInput):
     ticket = {
         "ticket_id": public["id"],
         "id": public["id"],
-        "verify_code": public.get("booking_code", ""),
+        "verify_code": public.get("verify_code") or public.get("booking_code", ""),
         "booking_code": public.get("booking_code", ""),
         "status": public.get("status", "pending"),
         "stake": public.get("stake", 0),
@@ -1191,6 +1289,27 @@ async def list_tickets(user:dict=Depends(get_current_user)):
         except Exception as exc:
             logger.exception("Skipping malformed ticket %s: %s", d.get("id") or d.get("_id"), exc)
     return result
+
+@router.delete("/tickets/history")
+async def clear_ticket_history(user: dict = Depends(get_current_user)):
+    """Delete only this user's settled tickets; financial transaction records remain intact."""
+    result = await db.tickets.delete_many({
+        "user_id": str(user["_id"]),
+        "status": {"$in": ["won", "lost", "void", "cancelled"]}
+    })
+    return {"ok": True, "deleted": result.deleted_count, "note": "Wallet and audit transaction records were not deleted."}
+
+
+@router.delete("/tickets/{ticket_id}")
+async def delete_settled_ticket(ticket_id: str, user: dict = Depends(get_current_user)):
+    result = await db.tickets.delete_one({
+        "id": ticket_id,
+        "user_id": str(user["_id"]),
+        "status": {"$in": ["won", "lost", "void", "cancelled"]}
+    })
+    if result.deleted_count != 1:
+        raise HTTPException(status_code=404, detail="Settled ticket not found")
+    return {"ok": True}
 
 # ------------------------------------------------------------------ auth routes
 @router.post("/auth/register")
@@ -1450,6 +1569,30 @@ async def staff_commissions(user: dict = Depends(require_staff)):
     return {"commission_rate": REFERRAL_COMMISSION_RATE, "today": today_total, "all_time": all_time, "ledger": rows}
 
 
+@router.get("/admin/commission-ledger")
+async def admin_commission_ledger(admin: dict = Depends(require_admin)):
+    docs = await db.transactions.find({"type": "referral_commission"}).sort("created_at", -1).to_list(2000)
+    referred_ids = [d.get("referred_user_id") for d in docs if d.get("referred_user_id") and ObjectId.is_valid(str(d.get("referred_user_id")))]
+    staff_ids = [d.get("user_id") for d in docs if d.get("user_id") and ObjectId.is_valid(str(d.get("user_id")))]
+    ids = {str(x) for x in referred_ids + staff_ids}
+    lookup = {}
+    if ids:
+        async for u in db.users.find({"_id": {"$in": [ObjectId(x) for x in ids]}}):
+            lookup[str(u["_id"])] = {"name": u.get("name", ""), "email": u.get("email", ""), "phone": u.get("phone", ""), "referral_code": u.get("referral_code", ""), "role": u.get("role", "")}
+    rows = [{
+        "id": d.get("id", str(d.get("_id", ""))), "created_at": d.get("created_at"),
+        "deposit_amount": round(float(d.get("deposit_amount", 0) or 0), 2),
+        "commission": round(float(d.get("amount", 0) or 0), 2),
+        "staff": lookup.get(str(d.get("user_id")), {}),
+        "user": lookup.get(str(d.get("referred_user_id")), {}),
+        "deposit_reference": d.get("deposit_reference"),
+        "commission_rate": d.get("commission_rate", REFERRAL_COMMISSION_RATE)
+    } for d in docs]
+    today = datetime.now(timezone.utc).date().isoformat()
+    return {"today": round(sum(r["commission"] for r in rows if str(r.get("created_at", "")).startswith(today)), 2),
+            "all_time": round(sum(r["commission"] for r in rows), 2), "ledger": rows}
+
+
 @router.post("/staff/demo-credit")
 async def demo_credit(body: DemoCreditInput, user: dict = Depends(require_staff)):
     amount = round(float(body.amount), 2)
@@ -1536,8 +1679,6 @@ async def update_staff(user_id: str, body: StaffUpdateInput, manager: dict = Dep
         raise HTTPException(status_code=404, detail="Staff account not found")
     if target.get("role") == "super_admin" and manager.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Admins cannot modify Super Admin accounts")
-    if manager.get("role") == "admin" and target.get("role") != "sub_admin":
-        raise HTTPException(status_code=403, detail="Admins can only edit Sub-Admin accounts")
     values = {}
     for key in ("name", "email", "phone"):
         value = getattr(body, key, None)
@@ -1661,7 +1802,7 @@ async def admin_transactions(status: Optional[str] = None, transaction_type: Opt
 
 @router.post("/admin/transactions/{transaction_id}/review")
 async def review_transaction(transaction_id: str, action: Literal["approve", "reject"],
-                             reason: str = "", staff: dict = Depends(require_permission("transactions.review"))):
+                             reason: str = "", staff: dict = Depends(require_admin)):
     txn = await db.transactions.find_one({"id": transaction_id})
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -1770,13 +1911,35 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
 @router.get("/admin/users")
 async def list_users(admin: dict = Depends(require_permission("users.view"))):
     docs = await db.users.find().sort("created_at", -1).to_list(500)
+    referrer_ids = [d.get("referred_by") for d in docs if d.get("referred_by") and ObjectId.is_valid(str(d.get("referred_by")))]
+    referrers = {}
+    if referrer_ids:
+        async for ref in db.users.find({"_id": {"$in": [ObjectId(x) for x in set(referrer_ids)]}}):
+            referrers[str(ref["_id"])] = {"code": ref.get("referral_code", ""), "name": ref.get("name", ""), "role": ref.get("role", "")}
     return [
         {"id": str(d["_id"]), "email": d["email"], "name": d.get("name", ""),
          "role": d.get("role", "user"), "permissions": d.get("permissions", []), "balance": round(d.get("balance", 0.0), 2),
-         "referral_code": d.get("referral_code", ""), "commission_total": round(d.get("commission_total", 0.0), 2),
+         "referral_code": d.get("referral_code", ""), "referral_used": referrers.get(str(d.get("referred_by")), {}).get("code", d.get("referral_code_used", d.get("referral_used", ""))),
+         "referrer_name": referrers.get(str(d.get("referred_by")), {}).get("name", ""),
+         "commission_total": round(d.get("commission_total", 0.0), 2),
          "phone": d.get("phone", ""), "created_at": d.get("created_at") }
         for d in docs
     ]
+
+
+@router.delete("/admin/users/{user_id}")
+async def delete_global_user(user_id: str, admin: dict = Depends(require_permission("users.manage"))):
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user id")
+    target = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if str(target["_id"]) == str(admin["_id"]):
+        raise HTTPException(status_code=400, detail="You cannot delete your own account here")
+    if target.get("role") in {"super_admin", "admin", "sub_admin"}:
+        raise HTTPException(status_code=403, detail="Global User Profiles can only delete regular user accounts; use Staff & Access Control for staff.")
+    await db.users.delete_one({"_id": target["_id"]})
+    return {"ok": True}
 
 
 @router.put("/admin/users/{user_id}/role")
@@ -1790,8 +1953,6 @@ async def set_user_role(user_id: str, body: RoleInput, admin: dict = Depends(req
         raise HTTPException(status_code=404, detail="User not found")
     if target.get("role") == "super_admin":
         raise HTTPException(status_code=403, detail="Super Admin accounts cannot be modified")
-    if admin.get("role") == "sub_admin" and (target.get("role") in STAFF_ROLES or body.role in ("admin", "sub_admin")):
-        raise HTTPException(status_code=403, detail="Sub-Admins cannot assign or modify staff roles")
     if admin.get("role") == "admin" and target.get("role") == "admin":
         raise HTTPException(status_code=403, detail="Admins cannot modify or demote Admin accounts")
     if admin.get("role") == "admin" and body.role == "admin":
@@ -1869,11 +2030,11 @@ def event_public(doc: dict) -> dict:
         "away": doc["away"],
         "odds": {
             "home": round(doc["odds_home"], 2),
-            "draw": round(doc["odds_draw"], 2),
+            "draw": round(doc["odds_draw"], 2) if doc.get("odds_draw") is not None else None,
             "away": round(doc["odds_away"], 2),
         },
         "status": doc["status"],
-        "phase": "live" if doc.get("status") == "live" else ("finished" if doc.get("status") == "finished" else "scheduled"),
+        "phase": "live" if doc.get("status") == "live" else ("paused" if doc.get("status") == "paused" else ("finished" if doc.get("status") == "finished" else "scheduled")),
         "minute": minute,
         "score": {"home": int(doc.get("home_score", 0) or 0), "away": int(doc.get("away_score", 0) or 0)},
         "halftime_score": {"home": doc.get("halftime_home_score"), "away": doc.get("halftime_away_score")},
@@ -1920,10 +2081,10 @@ async def league_detail(slug: str):
 async def list_events(sport: Optional[str] = None, q: Optional[str] = None,
                       status: Optional[str] = "open", limit: int = 40, skip: int = 0):
     query = {}
-    if status in ("open", "live", "finished", "cancelled"):
+    if status in ("open", "live", "paused", "finished", "cancelled"):
         query["status"] = status
     elif status == "all":
-        query["status"] = {"$in": ["open", "live", "finished", "cancelled"]}
+        query["status"] = {"$in": ["open", "live", "paused", "finished", "cancelled"]}
     if sport and sport != "all":
         query["sport"] = sport
     if q:
@@ -1958,7 +2119,7 @@ async def create_event(body: EventInput, staff: dict = Depends(require_permissio
         "home": body.home,
         "away": body.away,
         "odds_home": body.odds_home,
-        "odds_draw": body.odds_draw,
+        "odds_draw": body.odds_draw if body.sport.strip().lower() not in {"basketball", "tennis"} else None,
         "odds_away": body.odds_away,
         "status": "open",
         "minute": 0,
@@ -1981,7 +2142,8 @@ async def update_event(event_id: str, body: EventInput, staff: dict = Depends(re
     values = {
         "sport": body.sport.strip(), "league": body.league.strip(),
         "home": body.home.strip(), "away": body.away.strip(),
-        "odds_home": round(body.odds_home, 2), "odds_draw": round(body.odds_draw, 2),
+        "odds_home": round(body.odds_home, 2),
+        "odds_draw": round(body.odds_draw, 2) if body.odds_draw is not None and body.sport.strip().lower() not in {"basketball", "tennis"} else None,
         "odds_away": round(body.odds_away, 2),
         "kickoff_at": body.kickoff_at.isoformat() if body.kickoff_at else None,
     }
