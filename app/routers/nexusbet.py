@@ -19,6 +19,8 @@ import logging
 import math
 import csv
 import requests
+import hmac
+import hashlib
 import io
 import re
 from datetime import datetime, timezone, timedelta
@@ -496,27 +498,9 @@ def require_permission(permission: str = ""):
     return dependency
 
 DEFAULT_PAYMENT_METHODS = {
-    "mtn_manual": {
-        "id": "mtn_manual", "label": "MTN MoMo — Manual", "active": True,
-        "receiving_number": "0532026267",
-        "recipient_name": "Gyan Godfred Fosu Nexus’s Approver dè depositè",
-        "instructions": "Send the exact deposit amount to the receiving MTN MoMo number. Enter your sender phone number, sender name and the MTN transaction/reference ID below. You may attach a screenshot of the payment proof."
-    },
-    "telecel_manual": {
-        "id": "telecel_manual", "label": "Telecel Cash — Manual", "active": True,
-        "receiving_number": "0509623244",
-        "recipient_name": "Gyan Godfred Fosu Nexus’s Approver dè depositè",
-        "instructions": "Send the exact deposit amount to the receiving Telecel Cash number. Enter your sender phone number, sender name and the Telecel transaction/reference ID below. You may attach a screenshot of the payment proof."
-    },
-    "bank_transfer_manual": {
-        "id": "bank_transfer_manual", "label": "Bank Transfer — Manual", "active": True,
-        "bank_name": "GCB",
-        "account_number": "1011103552151",
-        "account_name": "Godfred Fosu Gyan",
-        "branch": "",
-        "bank_code": "",
-        "instructions": "Transfer the exact deposit amount to the bank account shown. Enter the sender/account name and bank transaction/reference ID below. You may attach a screenshot of the transfer proof."
-    },
+    "mtn": {"id": "mtn", "label": "MTN MoMo", "provider": "mtn", "active": True},
+    "telecel": {"id": "telecel", "label": "Telecel Cash", "provider": "vod", "active": True},
+    "airteltigo": {"id": "airteltigo", "label": "AirtelTigo Money", "provider": "atl", "active": True},
 }
 
 DEFAULT_SETTINGS = {
@@ -525,6 +509,7 @@ DEFAULT_SETTINGS = {
     "first_deposit_bonus_cap": 100.0,
     "payment_methods": DEFAULT_PAYMENT_METHODS,
 }
+
 
 FIRST_DEPOSIT_BONUS_CAP = 100.0
 
@@ -543,10 +528,10 @@ async def get_settings() -> dict:
 
 def public_payment_methods(settings: dict, include_inactive: bool = False) -> list:
     methods = []
-    for key in ("mtn_manual", "telecel_manual", "bank_transfer_manual"):
+    for key in ("mtn", "telecel", "airteltigo"):
         cfg = dict(settings["payment_methods"][key])
         if include_inactive or cfg.get("active", True):
-            methods.append(cfg)
+            methods.append({"id": key, "label": cfg["label"], "active": bool(cfg.get("active", True))})
     return methods
 
 
@@ -612,21 +597,15 @@ class VirtualControlInput(BaseModel):
 
 class DepositInput(BaseModel):
     amount: float = Field(gt=0, le=1000000)
-    method: Literal["mtn_manual", "telecel_manual", "bank_transfer_manual"]
-    sender_name: str = Field(min_length=1, max_length=120)
-    sender_phone: str = Field(min_length=7, max_length=25)
-    sender_account_name: Optional[str] = Field(default="", max_length=120)
-    transaction_reference: str = Field(min_length=3, max_length=120)
-    proof_data_url: Optional[str] = Field(default=None, max_length=3000000)
+    method: Literal["mtn", "telecel", "airteltigo"]
+    phone_number: str = Field(min_length=7, max_length=25)
 
-class PaymentMethodConfigInput(BaseModel):
-    mtn_manual: dict = Field(default_factory=dict)
-    telecel_manual: dict = Field(default_factory=dict)
-    bank_transfer_manual: dict = Field(default_factory=dict)
+
+
 
 class WithdrawInput(BaseModel):
     amount: float = Field(gt=0, le=1000000)
-    method: Literal["mtn", "telecel", "airteltigo", "bank"] = "mtn"
+    method: Literal["mtn", "telecel", "airteltigo"] = "mtn"
     destination: str = Field(min_length=4, max_length=120)
     phone_number: str = Field(min_length=7, max_length=25)
 
@@ -1401,8 +1380,85 @@ async def wallet_payment_methods(user: dict = Depends(get_current_user)):
     return public_payment_methods(settings)
 
 
-async def _reject_legacy_deposit_method(method: str):
-    raise HTTPException(status_code=400, detail="Unsupported deposit method. Only MTN MoMo Manual, Telecel Cash Manual and Bank Transfer Manual are accepted.")
+async def _paystack_request(method: str, path: str, payload: Optional[dict] = None):
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Automatic payments are not configured yet. Please contact support.")
+    def _request():
+        return requests.request(
+            method, f"https://api.paystack.co{path}",
+            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+            json=payload, timeout=25,
+        )
+    try:
+        response = await asyncio.to_thread(_request)
+        data = response.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach the payment provider. Please try again.")
+    if response.status_code >= 400 or not data.get("status"):
+        message = data.get("message") or "Payment provider rejected the request"
+        raise HTTPException(status_code=502, detail=message)
+    return data.get("data") or {}
+
+
+async def _complete_paystack_deposit(reference: str, amount_kobo: int, currency: str = "GHS"):
+    txn = await db.transactions.find_one({"type": "deposit", "gateway": "paystack", "gateway_reference": reference})
+    if not txn or currency.upper() != "GHS" or int(round(float(txn.get("amount", 0)) * 100)) != int(amount_kobo):
+        return False
+    if txn.get("credited") or txn.get("status") == "credited":
+        return True
+    if txn.get("status") == "pending":
+        claimed = await db.transactions.find_one_and_update(
+            {"id": txn["id"], "status": "pending", "credited": False},
+            {"$set": {"status": "processing", "provider_confirmed_at": datetime.now(timezone.utc).isoformat()}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            fresh = await db.transactions.find_one({"id": txn["id"]})
+            return bool(fresh and fresh.get("credited"))
+    elif txn.get("status") != "processing":
+        return False
+
+    user_id = ObjectId(txn["user_id"])
+    target_user = await db.users.find_one({"_id": user_id})
+    if not target_user:
+        return False
+    bonus_cap = float((await get_settings()).get("first_deposit_bonus_cap", FIRST_DEPOSIT_BONUS_CAP))
+    bonus = min(float(txn["amount"]), bonus_cap) if not target_user.get("first_deposit_bonus_awarded", False) else 0.0
+    base_update = {
+        "$inc": {"balance": float(txn["amount"]), "total_deposited": float(txn["amount"])},
+        "$addToSet": {"credited_deposit_ids": txn["id"]},
+    }
+    if bonus:
+        bonus_update = {
+            "$inc": {"balance": float(txn["amount"]) + bonus, "total_deposited": float(txn["amount"])},
+            "$set": {"first_deposit_bonus_awarded": True},
+            "$addToSet": {"credited_deposit_ids": txn["id"]},
+        }
+        result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}, "first_deposit_bonus_awarded": {"$ne": True}}, bonus_update)
+        if not result.modified_count:
+            bonus = 0.0
+            result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update)
+    else:
+        result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update)
+    if not result.modified_count:
+        already_credited = await db.users.find_one({"_id": user_id, "credited_deposit_ids": txn["id"]}, {"_id": 1})
+        if not already_credited:
+            return False
+        bonus = 0.0
+    now = datetime.now(timezone.utc).isoformat()
+    await db.transactions.update_one({"id": txn["id"], "status": "processing"}, {"$set": {"status": "credited", "credited": True, "credited_at": now, "bonus_amount": round(bonus, 2)}})
+    if bonus:
+        await db.transactions.insert_one({"id": str(uuid.uuid4()), "reference": f"NB-B-{uuid.uuid4().hex[:10].upper()}", "user_id": txn["user_id"], "type": "first_deposit_bonus", "amount": round(bonus, 2), "method": "promotion", "status": "credited", "deposit_reference": txn.get("reference"), "created_at": now, "promotion": "100% first deposit bonus up to GHS 100"})
+    referred_by = target_user.get("referred_by")
+    if referred_by and ObjectId.is_valid(str(referred_by)) and result.modified_count:
+        referrer = await db.users.find_one({"_id": ObjectId(str(referred_by)), "role": "sub_admin"})
+        if referrer:
+            commission = round(float(txn["amount"]) * REFERRAL_COMMISSION_RATE, 2)
+            await db.users.update_one({"_id": referrer["_id"]}, {"$inc": {"commission_total": commission}})
+            await db.transactions.insert_one({"id": str(uuid.uuid4()), "reference": f"NB-C-{uuid.uuid4().hex[:10].upper()}", "user_id": str(referrer["_id"]), "type": "referral_commission", "amount": commission, "deposit_amount": float(txn["amount"]), "referred_user_id": txn["user_id"], "method": "referral", "status": "earned", "commission_rate": REFERRAL_COMMISSION_RATE, "created_at": now, "deposit_reference": txn.get("reference")})
+    await db.audit_logs.insert_one({"type": "deposit", "action": "automatically_credited", "deposit_id": txn["id"], "user_id": txn["user_id"], "amount": txn["amount"], "method": txn["method"], "gateway": "paystack", "gateway_reference": reference, "bonus_amount": round(bonus, 2), "at": now})
+    return True
 
 
 @router.post("/wallet/deposit")
@@ -1414,53 +1470,81 @@ async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail=f"Minimum deposit is GHS {settings['min_deposit']:.0f}")
     method_cfg = settings["payment_methods"].get(body.method)
     if not method_cfg or not method_cfg.get("active", True):
-        raise HTTPException(status_code=400, detail="This manual deposit method is currently unavailable.")
-
-    reference = body.transaction_reference.strip()
-    if not reference:
-        raise HTTPException(status_code=400, detail="Transaction/reference ID is required")
-    duplicate = await db.transactions.find_one({
-        "type": "deposit",
-        "transaction_reference": {"$regex": f"^{re.escape(reference)}$", "$options": "i"},
-    })
-    if duplicate:
-        raise HTTPException(status_code=409, detail="This payment transaction/reference has already been submitted.")
-
+        raise HTTPException(status_code=400, detail="This mobile money provider is currently unavailable.")
+    if not user.get("email"):
+        raise HTTPException(status_code=400, detail="Add a valid email address to your account before depositing.")
+    phone = re.sub(r"[^0-9]", "", body.phone_number)
+    if phone.startswith("233") and len(phone) == 12:
+        phone = "0" + phone[3:]
+    if not phone.startswith("0") or len(phone) != 10:
+        raise HTTPException(status_code=400, detail="Enter a valid Ghana mobile number, e.g. 0241234567.")
+    internal_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    txn = {
-        "id": str(uuid.uuid4()),
-        "reference": f"NB-D-{uuid.uuid4().hex[:10].upper()}",
-        "user_id": str(user["_id"]),
-        "type": "deposit",
-        "amount": round(body.amount, 2),
-        "method": body.method,
-        "sender_name": body.sender_name.strip(),
-        "sender_phone": body.sender_phone.strip(),
-        "sender_account_name": body.sender_account_name.strip(),
-        "transaction_reference": reference,
-        "proof_data_url": body.proof_data_url,
-        "status": "pending",
-        "credited": False,
-        "created_at": now,
-        "audit_history": [{"action": "submitted", "submitted_at": now, "submitted_by": str(user["_id"])}],
-    }
-    try:
-        await db.transactions.insert_one(txn)
-    except Exception as exc:
-        if "duplicate" in str(exc).lower():
-            raise HTTPException(status_code=409, detail="This payment transaction/reference has already been submitted.")
-        raise
-    await db.audit_logs.insert_one({
-        "type": "deposit", "action": "submitted", "deposit_id": txn["id"],
-        "user_id": str(user["_id"]), "amount": txn["amount"], "method": txn["method"],
-        "transaction_reference": reference, "at": now, "actor_id": str(user["_id"]),
+    await db.transactions.insert_one({
+        "id": internal_id, "reference": f"NB-D-{uuid.uuid4().hex[:10].upper()}",
+        "user_id": str(user["_id"]), "type": "deposit", "amount": round(body.amount, 2),
+        "method": body.method, "phone_number": phone, "status": "initiating", "credited": False,
+        "gateway": "paystack", "created_at": now,
     })
-    return {"id": txn["id"], "reference": txn["reference"], "status": "pending", "message": "Deposit submitted for review. Your wallet will be credited only after approval."}
+    try:
+        charge = await _paystack_request("POST", "/charge", {
+            "email": user["email"], "amount": int(round(body.amount * 100)), "currency": "GHS",
+            "mobile_money": {"phone": phone, "provider": method_cfg["provider"]},
+            "metadata": {"nexusbet_deposit_id": internal_id, "user_id": str(user["_id"])},
+        })
+    except HTTPException:
+        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed"}})
+        raise
+    gateway_ref = charge.get("reference")
+    if not gateway_ref:
+        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed"}})
+        raise HTTPException(status_code=502, detail="Payment provider did not return a transaction reference.")
+    await db.transactions.update_one({"id": internal_id}, {"$set": {"gateway_reference": gateway_ref, "status": "pending", "provider_status": charge.get("status", "pay_offline")}})
+    return {"id": internal_id, "reference": gateway_ref, "status": "pending", "message": charge.get("display_text") or "Approve the payment request on your mobile money phone, then check the status here."}
+
+
+@router.get("/wallet/deposit/verify/{reference}")
+async def verify_wallet_deposit(reference: str, user: dict = Depends(get_current_user)):
+    txn = await db.transactions.find_one({"type": "deposit", "gateway": "paystack", "gateway_reference": reference, "user_id": str(user["_id"])})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Deposit reference not found.")
+    if txn.get("credited"):
+        return {"status": "credited", "message": "Payment confirmed and wallet credited."}
+    result = await _paystack_request("GET", f"/transaction/verify/{reference}")
+    state = str(result.get("status", "")).lower()
+    if state == "success":
+        completed = await _complete_paystack_deposit(reference, int(result.get("amount", 0)), result.get("currency", "GHS"))
+        if completed:
+            return {"status": "credited", "message": "Payment confirmed and wallet credited."}
+    if state in ("failed", "abandoned"):
+        await db.transactions.update_one({"id": txn["id"], "status": "pending"}, {"$set": {"status": "failed", "provider_status": state}})
+        return {"status": "failed", "message": "The mobile money payment was not completed."}
+    return {"status": "pending", "message": "Payment is still awaiting mobile money confirmation."}
+
+
+@router.post("/payments/paystack/webhook")
+async def paystack_webhook(request: Request):
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Payment webhook is not configured")
+    raw = await request.body()
+    signature = request.headers.get("x-paystack-signature", "")
+    expected = hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest()
+    if not signature or not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        event = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+    if event.get("event") == "charge.success":
+        data = event.get("data") or {}
+        await _complete_paystack_deposit(str(data.get("reference", "")), int(data.get("amount", 0)), str(data.get("currency", "GHS")))
+    return {"received": True}
 
 
 @router.post("/wallet/deposit/manual")
 async def legacy_manual_deposit_rejected(request: Request):
-    raise HTTPException(status_code=410, detail="The legacy manual deposit endpoint is disabled. Use /wallet/deposit with mtn_manual, telecel_manual or bank_transfer_manual.")
+    raise HTTPException(status_code=410, detail="Manual deposits are disabled. Use the automatic mobile money checkout.")
 
 
 @router.post("/wallet/withdraw")
@@ -1742,45 +1826,6 @@ async def update_settings(body: SettingsInput, admin: dict = Depends(require_adm
     if updates:
         await db.settings.update_one({"_id": "global"}, {"$set": updates}, upsert=True)
     return await get_settings()
-
-
-@router.get("/admin/payment-methods")
-async def admin_payment_methods(super_admin: dict = Depends(require_super_admin)):
-    settings = await get_settings()
-    return public_payment_methods(settings, include_inactive=True)
-
-
-@router.put("/admin/payment-methods")
-async def update_payment_methods(body: PaymentMethodConfigInput, super_admin: dict = Depends(require_super_admin)):
-    settings = await get_settings()
-    current = settings["payment_methods"]
-    incoming = body.model_dump()
-    merged = {}
-    allowed_fields = {
-        "mtn_manual": {"id", "label", "active", "receiving_number", "recipient_name", "instructions"},
-        "telecel_manual": {"id", "label", "active", "receiving_number", "recipient_name", "instructions"},
-        "bank_transfer_manual": {"id", "label", "active", "bank_name", "account_number", "account_name", "branch", "bank_code", "instructions"},
-    }
-    for key in ("mtn_manual", "telecel_manual", "bank_transfer_manual"):
-        patch = incoming.get(key) or {}
-        base = dict(current[key])
-        for field, value in patch.items():
-            if field in allowed_fields[key] and value is not None:
-                if isinstance(value, str):
-                    value = value.strip()
-                base[field] = value
-        base["id"] = key
-        base["active"] = bool(base.get("active", True))
-        merged[key] = base
-    changed = {key: {"previous": current[key], "new": merged[key]} for key in merged if current[key] != merged[key]}
-    await db.settings.update_one({"_id": "global"}, {"$set": {"payment_methods": merged}}, upsert=True)
-    if changed:
-        await db.audit_logs.insert_one({
-            "type": "payment_config", "action": "updated", "actor_id": str(super_admin["_id"]),
-            "actor_role": super_admin.get("role"), "changes": changed,
-            "at": datetime.now(timezone.utc).isoformat(),
-        })
-    return list(merged.values())
 
 
 @router.get("/admin/transactions")
