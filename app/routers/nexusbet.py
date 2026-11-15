@@ -23,6 +23,7 @@ import hmac
 import hashlib
 import io
 import re
+from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Any
 
@@ -1380,30 +1381,79 @@ async def wallet_payment_methods(user: dict = Depends(get_current_user)):
     return public_payment_methods(settings)
 
 
-async def _paystack_request(method: str, path: str, payload: Optional[dict] = None):
-    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
-    if not secret:
-        raise HTTPException(status_code=503, detail="Automatic payments are not configured yet. Please contact support.")
+
+ALPHAPAY_BASE_URL = os.getenv("ALPHAPAY_BASE_URL", "https://api.alphapay.me").rstrip("/")
+ALPHAPAY_NETWORKS = {
+    "mtn": "mtn_gh",
+    "telecel": "vodafone_gh",
+    "airteltigo": "tigo_gh",
+}
+
+
+async def _alphapay_request(method: str, path: str, payload: Optional[dict] = None):
+    api_key = os.getenv("ALPHAPAY_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="AlphaPay is not configured yet. Please contact support.")
+
     def _request():
         return requests.request(
-            method, f"https://api.paystack.co{path}",
-            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
-            json=payload, timeout=25,
+            method,
+            f"{ALPHAPAY_BASE_URL}{path}",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+            timeout=30,
         )
+
     try:
         response = await asyncio.to_thread(_request)
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
     except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach the payment provider. Please try again.")
-    if response.status_code >= 400 or not data.get("status"):
-        message = data.get("message") or "Payment provider rejected the request"
-        raise HTTPException(status_code=502, detail=message)
-    return data.get("data") or {}
+        raise HTTPException(status_code=502, detail="Could not reach AlphaPay. Please try again.")
+
+    if response.status_code >= 400:
+        message = data.get("message") or data.get("detail") or "AlphaPay rejected the payment request."
+        raise HTTPException(status_code=502, detail=str(message))
+
+    # AlphaPay responses may wrap the transaction in `data`; retain the full
+    # payload so status/reference fields are not lost when the response shape varies.
+    if isinstance(data, dict):
+        result_meta = data.get("result") if isinstance(data.get("result"), dict) else {}
+        if data.get("success") is False or str(result_meta.get("resultStatus", "")).upper() == "F":
+            message = result_meta.get("resultMessage") or data.get("message") or "AlphaPay rejected the payment request."
+            raise HTTPException(status_code=502, detail=str(message))
+    return data if isinstance(data, dict) else {}
 
 
-async def _complete_paystack_deposit(reference: str, amount_kobo: int, currency: str = "GHS"):
-    txn = await db.transactions.find_one({"type": "deposit", "gateway": "paystack", "gateway_reference": reference})
-    if not txn or currency.upper() != "GHS" or int(round(float(txn.get("amount", 0)) * 100)) != int(amount_kobo):
+def _alphapay_payload_data(payload: dict) -> dict:
+    value = payload.get("data")
+    return value if isinstance(value, dict) else payload
+
+
+def _alphapay_state(payload: dict) -> str:
+    data = _alphapay_payload_data(payload)
+    return str(
+        data.get("status")
+        or data.get("payment_status")
+        or payload.get("status")
+        or payload.get("payment_status")
+        or ""
+    ).strip().lower()
+
+
+async def _complete_alphapay_deposit(reference: str, amount: float, currency: str = "GHS"):
+    txn = await db.transactions.find_one({
+        "type": "deposit", "gateway": "alphapay", "gateway_reference": reference
+    })
+    if not txn or currency.upper() != "GHS":
+        return False
+    if not math.isclose(float(txn.get("amount", 0)), float(amount), rel_tol=0, abs_tol=0.01):
         return False
     if txn.get("credited") or txn.get("status") == "credited":
         return True
@@ -1435,36 +1485,63 @@ async def _complete_paystack_deposit(reference: str, amount_kobo: int, currency:
             "$set": {"first_deposit_bonus_awarded": True},
             "$addToSet": {"credited_deposit_ids": txn["id"]},
         }
-        result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}, "first_deposit_bonus_awarded": {"$ne": True}}, bonus_update)
+        result = await db.users.update_one(
+            {"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}, "first_deposit_bonus_awarded": {"$ne": True}},
+            bonus_update,
+        )
         if not result.modified_count:
             bonus = 0.0
-            result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update)
+            result = await db.users.update_one(
+                {"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update
+            )
     else:
-        result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update)
+        result = await db.users.update_one(
+            {"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update
+        )
     if not result.modified_count:
-        already_credited = await db.users.find_one({"_id": user_id, "credited_deposit_ids": txn["id"]}, {"_id": 1})
+        already_credited = await db.users.find_one(
+            {"_id": user_id, "credited_deposit_ids": txn["id"]}, {"_id": 1}
+        )
         if not already_credited:
             return False
         bonus = 0.0
     now = datetime.now(timezone.utc).isoformat()
-    await db.transactions.update_one({"id": txn["id"], "status": "processing"}, {"$set": {"status": "credited", "credited": True, "credited_at": now, "bonus_amount": round(bonus, 2)}})
+    await db.transactions.update_one(
+        {"id": txn["id"], "status": "processing"},
+        {"$set": {"status": "credited", "credited": True, "credited_at": now, "bonus_amount": round(bonus, 2)}},
+    )
     if bonus:
-        await db.transactions.insert_one({"id": str(uuid.uuid4()), "reference": f"NB-B-{uuid.uuid4().hex[:10].upper()}", "user_id": txn["user_id"], "type": "first_deposit_bonus", "amount": round(bonus, 2), "method": "promotion", "status": "credited", "deposit_reference": txn.get("reference"), "created_at": now, "promotion": "100% first deposit bonus up to GHS 100"})
+        await db.transactions.insert_one({
+            "id": str(uuid.uuid4()), "reference": f"NB-B-{uuid.uuid4().hex[:10].upper()}",
+            "user_id": txn["user_id"], "type": "first_deposit_bonus", "amount": round(bonus, 2),
+            "method": "promotion", "status": "credited", "deposit_reference": txn.get("reference"),
+            "created_at": now, "promotion": "100% first deposit bonus up to GHS 100",
+        })
     referred_by = target_user.get("referred_by")
     if referred_by and ObjectId.is_valid(str(referred_by)) and result.modified_count:
         referrer = await db.users.find_one({"_id": ObjectId(str(referred_by)), "role": "sub_admin"})
         if referrer:
             commission = round(float(txn["amount"]) * REFERRAL_COMMISSION_RATE, 2)
             await db.users.update_one({"_id": referrer["_id"]}, {"$inc": {"commission_total": commission}})
-            await db.transactions.insert_one({"id": str(uuid.uuid4()), "reference": f"NB-C-{uuid.uuid4().hex[:10].upper()}", "user_id": str(referrer["_id"]), "type": "referral_commission", "amount": commission, "deposit_amount": float(txn["amount"]), "referred_user_id": txn["user_id"], "method": "referral", "status": "earned", "commission_rate": REFERRAL_COMMISSION_RATE, "created_at": now, "deposit_reference": txn.get("reference")})
-    await db.audit_logs.insert_one({"type": "deposit", "action": "automatically_credited", "deposit_id": txn["id"], "user_id": txn["user_id"], "amount": txn["amount"], "method": txn["method"], "gateway": "paystack", "gateway_reference": reference, "bonus_amount": round(bonus, 2), "at": now})
+            await db.transactions.insert_one({
+                "id": str(uuid.uuid4()), "reference": f"NB-C-{uuid.uuid4().hex[:10].upper()}",
+                "user_id": str(referrer["_id"]), "type": "referral_commission", "amount": commission,
+                "deposit_amount": float(txn["amount"]), "referred_user_id": txn["user_id"],
+                "method": "referral", "status": "earned", "commission_rate": REFERRAL_COMMISSION_RATE,
+                "created_at": now, "deposit_reference": txn.get("reference"),
+            })
+    await db.audit_logs.insert_one({
+        "type": "deposit", "action": "automatically_credited", "deposit_id": txn["id"],
+        "user_id": txn["user_id"], "amount": txn["amount"], "method": txn["method"],
+        "gateway": "alphapay", "gateway_reference": reference, "bonus_amount": round(bonus, 2), "at": now,
+    })
     return True
 
 
 @router.post("/wallet/deposit")
 async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
-    if not math.isfinite(body.amount):
-        raise HTTPException(status_code=400, detail="Amount must be a finite number")
+    if not math.isfinite(body.amount) or body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be a valid positive number")
     settings = await get_settings()
     if body.amount < settings["min_deposit"]:
         raise HTTPException(status_code=400, detail=f"Minimum deposit is GHS {settings['min_deposit']:.0f}")
@@ -1474,71 +1551,127 @@ async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
     if not user.get("email"):
         raise HTTPException(status_code=400, detail="Add a valid email address to your account before depositing.")
     phone = re.sub(r"[^0-9]", "", body.phone_number)
-    if phone.startswith("233") and len(phone) == 12:
-        phone = "0" + phone[3:]
-    if not phone.startswith("0") or len(phone) != 10:
+    if phone.startswith("0") and len(phone) == 10:
+        phone = "233" + phone[1:]
+    elif phone.startswith("233") and len(phone) == 12:
+        pass
+    else:
         raise HTTPException(status_code=400, detail="Enter a valid Ghana mobile number, e.g. 0241234567.")
     internal_id = str(uuid.uuid4())
+    reference = f"NB-D-{uuid.uuid4().hex[:12].upper()}"
     now = datetime.now(timezone.utc).isoformat()
     await db.transactions.insert_one({
-        "id": internal_id, "reference": f"NB-D-{uuid.uuid4().hex[:10].upper()}",
-        "user_id": str(user["_id"]), "type": "deposit", "amount": round(body.amount, 2),
-        "method": body.method, "phone_number": phone, "status": "initiating", "credited": False,
-        "gateway": "paystack", "created_at": now,
+        "id": internal_id, "reference": reference, "user_id": str(user["_id"]),
+        "type": "deposit", "amount": round(body.amount, 2), "method": body.method,
+        "phone_number": phone, "status": "initiating", "credited": False,
+        "gateway": "alphapay", "created_at": now,
     })
+    payload = {
+        "amount": round(body.amount, 2),
+        "currency": "GHS",
+        "country": "GH",
+        "network": ALPHAPAY_NETWORKS[body.method],
+        "customer": {"phone": f"+{phone}", "email": user["email"]},
+        "reference": reference,
+        "return_url": os.getenv("ALPHAPAY_RETURN_URL", "").strip() or None,
+    }
+    payload = {key: value for key, value in payload.items() if value is not None}
     try:
-        charge = await _paystack_request("POST", "/charge", {
-            "email": user["email"], "amount": int(round(body.amount * 100)), "currency": "GHS",
-            "mobile_money": {"phone": phone, "provider": method_cfg["provider"]},
-            "metadata": {"nexusbet_deposit_id": internal_id, "user_id": str(user["_id"])},
-        })
+        result = await _alphapay_request("POST", "/v1/payments/softpay", payload)
     except HTTPException:
         await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed"}})
         raise
-    gateway_ref = charge.get("reference")
-    if not gateway_ref:
-        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed"}})
-        raise HTTPException(status_code=502, detail="Payment provider did not return a transaction reference.")
-    await db.transactions.update_one({"id": internal_id}, {"$set": {"gateway_reference": gateway_ref, "status": "pending", "provider_status": charge.get("status", "pay_offline")}})
-    return {"id": internal_id, "reference": gateway_ref, "status": "pending", "message": charge.get("display_text") or "Approve the payment request on your mobile money phone, then check the status here."}
+    data = _alphapay_payload_data(result)
+    provider_reference = str(data.get("reference") or data.get("transaction_reference") or reference)
+    state = _alphapay_state(result) or "pending"
+    if state in ("failed", "failure", "cancelled", "canceled", "rejected"):
+        await db.transactions.update_one(
+            {"id": internal_id}, {"$set": {"gateway_reference": provider_reference, "status": "failed", "provider_status": state}}
+        )
+        raise HTTPException(status_code=502, detail=str(data.get("message") or "AlphaPay could not initiate this payment."))
+    await db.transactions.update_one(
+        {"id": internal_id},
+        {"$set": {"gateway_reference": provider_reference, "status": "pending", "provider_status": state}},
+    )
+    return {
+        "id": internal_id, "reference": provider_reference, "status": "pending",
+        "message": data.get("message") or data.get("display_text") or "Approve the payment prompt on your mobile money phone, then check the status here.",
+    }
 
 
 @router.get("/wallet/deposit/verify/{reference}")
 async def verify_wallet_deposit(reference: str, user: dict = Depends(get_current_user)):
-    txn = await db.transactions.find_one({"type": "deposit", "gateway": "paystack", "gateway_reference": reference, "user_id": str(user["_id"])})
+    txn = await db.transactions.find_one({
+        "type": "deposit", "gateway": "alphapay", "gateway_reference": reference,
+        "user_id": str(user["_id"]),
+    })
     if not txn:
         raise HTTPException(status_code=404, detail="Deposit reference not found.")
     if txn.get("credited"):
         return {"status": "credited", "message": "Payment confirmed and wallet credited."}
-    result = await _paystack_request("GET", f"/transaction/verify/{reference}")
-    state = str(result.get("status", "")).lower()
-    if state == "success":
-        completed = await _complete_paystack_deposit(reference, int(result.get("amount", 0)), result.get("currency", "GHS"))
-        if completed:
+    verify_path_template = os.getenv("ALPHAPAY_VERIFY_PATH_TEMPLATE", "/v1/payments/verify/{reference}")
+    verify_path = verify_path_template.format(reference=quote(reference, safe=""))
+    result = await _alphapay_request("GET", verify_path)
+    data = _alphapay_payload_data(result)
+    state = _alphapay_state(result)
+    if state in ("success", "successful", "succeeded", "completed", "paid"):
+        paid_amount = data.get("amount", data.get("paid_amount", txn["amount"]))
+        currency = data.get("currency", "GHS")
+        try:
+            paid_amount = float(paid_amount)
+        except (TypeError, ValueError):
+            paid_amount = -1
+        if await _complete_alphapay_deposit(reference, paid_amount, str(currency)):
             return {"status": "credited", "message": "Payment confirmed and wallet credited."}
-    if state in ("failed", "abandoned"):
-        await db.transactions.update_one({"id": txn["id"], "status": "pending"}, {"$set": {"status": "failed", "provider_status": state}})
+    if state in ("failed", "failure", "abandoned", "cancelled", "canceled", "rejected", "expired"):
+        await db.transactions.update_one(
+            {"id": txn["id"], "status": "pending"},
+            {"$set": {"status": "failed", "provider_status": state}},
+        )
         return {"status": "failed", "message": "The mobile money payment was not completed."}
     return {"status": "pending", "message": "Payment is still awaiting mobile money confirmation."}
 
 
-@router.post("/payments/paystack/webhook")
-async def paystack_webhook(request: Request):
-    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+@router.post("/payments/alphapay/webhook")
+async def alphapay_webhook(request: Request):
+    secret = os.getenv("ALPHAPAY_WEBHOOK_SECRET", "").strip()
     if not secret:
-        raise HTTPException(status_code=503, detail="Payment webhook is not configured")
+        raise HTTPException(status_code=503, detail="AlphaPay webhook is not configured")
     raw = await request.body()
-    signature = request.headers.get("x-paystack-signature", "")
-    expected = hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest()
-    if not signature or not hmac.compare_digest(signature, expected):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    signature = request.headers.get("x-webhook-signature", "")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    if not signature or not timestamp:
+        raise HTTPException(status_code=401, detail="Missing AlphaPay webhook signature")
+    try:
+        sent_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        if abs((datetime.now(timezone.utc) - sent_at.astimezone(timezone.utc)).total_seconds()) > 300:
+            raise HTTPException(status_code=401, detail="Expired AlphaPay webhook")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid AlphaPay webhook timestamp")
+    expected = hmac.new(secret.encode(), timestamp.encode() + b"." + raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid AlphaPay webhook signature")
     try:
         event = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
-    if event.get("event") == "charge.success":
-        data = event.get("data") or {}
-        await _complete_paystack_deposit(str(data.get("reference", "")), int(data.get("amount", 0)), str(data.get("currency", "GHS")))
+    event_name = str(event.get("event") or "").lower()
+    data = event.get("data") if isinstance(event.get("data"), dict) else event
+    reference = str(data.get("reference") or data.get("merchant_reference") or "")
+    state = str(data.get("status") or "").lower()
+    if event_name in ("transaction.success", "payment.success", "payment.succeeded") or state in ("success", "successful", "succeeded", "completed", "paid"):
+        try:
+            amount = float(data.get("amount", data.get("paid_amount", 0)))
+        except (TypeError, ValueError):
+            amount = 0
+        await _complete_alphapay_deposit(reference, amount, str(data.get("currency") or "GHS"))
+    elif event_name in ("transaction.failed", "transaction.cancelled", "payment.failed", "payment.cancelled") or state in ("failed", "cancelled", "canceled", "rejected", "expired"):
+        await db.transactions.update_one(
+            {"type": "deposit", "gateway": "alphapay", "gateway_reference": reference, "status": "pending"},
+            {"$set": {"status": "failed", "provider_status": state or event_name}},
+        )
     return {"received": True}
 
 
