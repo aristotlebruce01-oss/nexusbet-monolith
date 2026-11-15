@@ -505,7 +505,7 @@ DEFAULT_PAYMENT_METHODS = {
 }
 
 DEFAULT_SETTINGS = {
-    "min_deposit": 1.0,
+    "min_deposit": 5.0,
     "min_withdrawal": 3000.0,
     "first_deposit_bonus_cap": 100.0,
     "payment_methods": DEFAULT_PAYMENT_METHODS,
@@ -520,17 +520,17 @@ async def get_settings() -> dict:
     if not doc:
         return dict(DEFAULT_SETTINGS)
 
-    # One-time migration: older deployments persisted the previous GHS 300
-    # default in MongoDB. Move that legacy default to the new GHS 1 minimum.
+    # One-time migration: move the previous GHS 300 and temporary GHS 1
+    # minimums to AlphaPay's documented GHS 5 minimum.
     # Preserve any other custom minimum configured by an administrator.
     stored_minimum = doc.get("min_deposit", DEFAULT_SETTINGS["min_deposit"])
     try:
-        if float(stored_minimum) == 300.0:
+        if float(stored_minimum) in (1.0, 300.0):
             await db.settings.update_one(
                 {"_id": "global", "min_deposit": stored_minimum},
-                {"$set": {"min_deposit": 1.0}},
+                {"$set": {"min_deposit": 5.0}},
             )
-            doc["min_deposit"] = 1.0
+            doc["min_deposit"] = 5.0
     except (TypeError, ValueError):
         pass
 
@@ -626,7 +626,7 @@ class WithdrawInput(BaseModel):
     phone_number: str = Field(min_length=7, max_length=25)
 
 class SettingsInput(BaseModel):
-    min_deposit: Optional[float] = Field(default=None, ge=1, le=1000000)
+    min_deposit: Optional[float] = Field(default=None, ge=5, le=1000000)
     min_withdrawal: Optional[float] = Field(default=None, ge=3000, le=1000000)
 
 class RoleInput(BaseModel):
@@ -2024,8 +2024,8 @@ async def read_settings(user: dict = Depends(get_current_user)):
 @router.put("/admin/settings")
 async def update_settings(body: SettingsInput, admin: dict = Depends(require_admin)):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if "min_deposit" in updates and updates["min_deposit"] < 1:
-        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 1")
+    if "min_deposit" in updates and updates["min_deposit"] < 5:
+        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 5")
     if "min_withdrawal" in updates and updates["min_withdrawal"] < 3000:
         raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 3,000")
     if updates:
