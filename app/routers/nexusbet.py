@@ -505,7 +505,7 @@ DEFAULT_PAYMENT_METHODS = {
 }
 
 DEFAULT_SETTINGS = {
-    "min_deposit": 300.0,
+    "min_deposit": 1.0,
     "min_withdrawal": 3000.0,
     "first_deposit_bonus_cap": 100.0,
     "payment_methods": DEFAULT_PAYMENT_METHODS,
@@ -611,7 +611,7 @@ class WithdrawInput(BaseModel):
     phone_number: str = Field(min_length=7, max_length=25)
 
 class SettingsInput(BaseModel):
-    min_deposit: Optional[float] = Field(default=None, ge=300, le=1000000)
+    min_deposit: Optional[float] = Field(default=None, ge=1, le=1000000)
     min_withdrawal: Optional[float] = Field(default=None, ge=3000, le=1000000)
 
 class RoleInput(BaseModel):
@@ -1390,20 +1390,24 @@ ALPHAPAY_NETWORKS = {
 }
 
 
-async def _alphapay_request(method: str, path: str, payload: Optional[dict] = None):
+async def _alphapay_request(method: str, path: str, payload: Optional[dict] = None, extra_headers: Optional[dict] = None):
     api_key = os.getenv("ALPHAPAY_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=503, detail="AlphaPay is not configured yet. Please contact support.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
 
     def _request():
         return requests.request(
             method,
             f"{ALPHAPAY_BASE_URL}{path}",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=headers,
             json=payload,
             timeout=30,
         )
@@ -1411,23 +1415,34 @@ async def _alphapay_request(method: str, path: str, payload: Optional[dict] = No
     try:
         response = await asyncio.to_thread(_request)
         try:
-            data = response.json()
+            parsed = response.json()
+            data = parsed if isinstance(parsed, dict) else {"message": str(parsed)[:500]}
         except Exception:
-            data = {}
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach AlphaPay. Please try again.")
+            data = {"message": (response.text or "")[:500]}
+    except requests.RequestException as exc:
+        logger = logging.getLogger(__name__)
+        logger.exception("AlphaPay network request failed (%s %s)", method, path)
+        raise HTTPException(status_code=502, detail="Could not reach AlphaPay. Please try again.") from exc
+    except Exception as exc:
+        logger = logging.getLogger(__name__)
+        logger.exception("Unexpected AlphaPay request error (%s %s)", method, path)
+        raise HTTPException(status_code=502, detail="Could not reach AlphaPay. Please try again.") from exc
 
     if response.status_code >= 400:
-        message = data.get("message") or data.get("detail") or "AlphaPay rejected the payment request."
-        raise HTTPException(status_code=502, detail=str(message))
+        message = data.get("message") or data.get("detail") or data.get("error") or "AlphaPay rejected the payment request."
+        code = data.get("code") or data.get("error_code")
+        logger = logging.getLogger(__name__)
+        logger.error("AlphaPay API rejected request: HTTP %s, code=%s, message=%s", response.status_code, str(code or "-"), str(message)[:300])
+        suffix = f" (AlphaPay code: {code})" if code else ""
+        raise HTTPException(status_code=502, detail=f"AlphaPay rejected the request: {str(message)[:300]}{suffix}")
 
-    # AlphaPay responses may wrap the transaction in `data`; retain the full
-    # payload so status/reference fields are not lost when the response shape varies.
     if isinstance(data, dict):
         result_meta = data.get("result") if isinstance(data.get("result"), dict) else {}
         if data.get("success") is False or str(result_meta.get("resultStatus", "")).upper() == "F":
             message = result_meta.get("resultMessage") or data.get("message") or "AlphaPay rejected the payment request."
-            raise HTTPException(status_code=502, detail=str(message))
+            logger = logging.getLogger(__name__)
+            logger.error("AlphaPay business rejection: %s", str(message)[:300])
+            raise HTTPException(status_code=502, detail=f"AlphaPay rejected the request: {str(message)[:300]}")
     return data if isinstance(data, dict) else {}
 
 
@@ -1449,7 +1464,12 @@ def _alphapay_state(payload: dict) -> str:
 
 async def _complete_alphapay_deposit(reference: str, amount: float, currency: str = "GHS"):
     txn = await db.transactions.find_one({
-        "type": "deposit", "gateway": "alphapay", "gateway_reference": reference
+        "type": "deposit", "gateway": "alphapay",
+        "$or": [
+            {"gateway_reference": reference},
+            {"alphapay_reference": reference},
+            {"reference": reference},
+        ],
     })
     if not txn or currency.upper() != "GHS":
         return False
@@ -1544,7 +1564,7 @@ async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Amount must be a valid positive number")
     settings = await get_settings()
     if body.amount < settings["min_deposit"]:
-        raise HTTPException(status_code=400, detail=f"Minimum deposit is GHS {settings['min_deposit']:.0f}")
+        raise HTTPException(status_code=400, detail=f"Minimum deposit is GHS {settings['min_deposit']:.2f}")
     method_cfg = settings["payment_methods"].get(body.method)
     if not method_cfg or not method_cfg.get("active", True):
         raise HTTPException(status_code=400, detail="This mobile money provider is currently unavailable.")
@@ -1566,36 +1586,68 @@ async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
         "phone_number": phone, "status": "initiating", "credited": False,
         "gateway": "alphapay", "created_at": now,
     })
+    # AlphaPay's current Softpay contract requires amount as a decimal string,
+    # a description, and a customer object. The returned AlphaPay `id` is the
+    # UUID required by the payment-verification endpoint.
+    full_name = str(user.get("name") or user.get("full_name") or "NexusBet customer").strip()
+    name_parts = full_name.split()
+    first_name = name_parts[0] if name_parts else "NexusBet"
+    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "Customer"
     payload = {
-        "amount": round(body.amount, 2),
+        "amount": f"{body.amount:.2f}",
         "currency": "GHS",
         "country": "GH",
+        "description": f"NexusBet wallet deposit {reference}",
+        "customer": {
+            "phone": f"+{phone}",
+            "email": user["email"],
+            "first_name": first_name,
+            "last_name": last_name,
+        },
         "network": ALPHAPAY_NETWORKS[body.method],
-        "customer": {"phone": f"+{phone}", "email": user["email"]},
-        "reference": reference,
-        "return_url": os.getenv("ALPHAPAY_RETURN_URL", "").strip() or None,
+        "metadata": {"nexusbet_reference": reference},
     }
-    payload = {key: value for key, value in payload.items() if value is not None}
     try:
-        result = await _alphapay_request("POST", "/v1/payments/softpay", payload)
+        result = await _alphapay_request(
+            "POST",
+            "/api/v1/payments/softpay/",
+            payload,
+            extra_headers={"Idempotency-Key": internal_id},
+        )
     except HTTPException:
         await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed"}})
         raise
+
     data = _alphapay_payload_data(result)
-    provider_reference = str(data.get("reference") or data.get("transaction_reference") or reference)
+    provider_id = str(data.get("id") or data.get("payment_id") or "").strip()
     state = _alphapay_state(result) or "pending"
-    if state in ("failed", "failure", "cancelled", "canceled", "rejected"):
+    checkout_url = data.get("checkout_url") or data.get("payment_url") or ""
+    if not provider_id:
+        logging.getLogger(__name__).error("AlphaPay softpay response did not contain a payment id; response keys=%s", sorted(data.keys()))
+        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed", "provider_status": "missing_payment_id"}})
+        raise HTTPException(status_code=502, detail="AlphaPay response did not include a payment reference. Please contact support before retrying.")
+    if state in ("failed", "failure", "cancelled", "canceled", "rejected", "expired"):
         await db.transactions.update_one(
-            {"id": internal_id}, {"$set": {"gateway_reference": provider_reference, "status": "failed", "provider_status": state}}
+            {"id": internal_id}, {"$set": {"gateway_reference": provider_id, "alphapay_reference": reference, "status": "failed", "provider_status": state}}
         )
         raise HTTPException(status_code=502, detail=str(data.get("message") or "AlphaPay could not initiate this payment."))
     await db.transactions.update_one(
         {"id": internal_id},
-        {"$set": {"gateway_reference": provider_reference, "status": "pending", "provider_status": state}},
+        {"$set": {
+            "gateway_reference": provider_id,
+            "alphapay_reference": reference,
+            "gateway_checkout_url": checkout_url,
+            "status": "pending",
+            "provider_status": state,
+        }},
     )
     return {
-        "id": internal_id, "reference": provider_reference, "status": "pending",
-        "message": data.get("message") or data.get("display_text") or "Approve the payment prompt on your mobile money phone, then check the status here.",
+        "id": internal_id,
+        "reference": provider_id,
+        "merchant_reference": reference,
+        "status": state,
+        "checkout_url": checkout_url,
+        "message": data.get("message") or "Approve the payment prompt on your mobile money phone. If a secure checkout link is provided, open it to complete payment.",
     }
 
 
@@ -1609,13 +1661,12 @@ async def verify_wallet_deposit(reference: str, user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail="Deposit reference not found.")
     if txn.get("credited"):
         return {"status": "credited", "message": "Payment confirmed and wallet credited."}
-    verify_path_template = os.getenv("ALPHAPAY_VERIFY_PATH_TEMPLATE", "/v1/payments/verify/{reference}")
-    verify_path = verify_path_template.format(reference=quote(reference, safe=""))
+    verify_path = f"/api/v1/payments/{quote(reference, safe='')}/verify/"
     result = await _alphapay_request("GET", verify_path)
     data = _alphapay_payload_data(result)
     state = _alphapay_state(result)
     if state in ("success", "successful", "succeeded", "completed", "paid"):
-        paid_amount = data.get("amount", data.get("paid_amount", txn["amount"]))
+        paid_amount = data.get("requested_amount", data.get("amount", data.get("paid_amount", txn["amount"])))
         currency = data.get("currency", "GHS")
         try:
             paid_amount = float(paid_amount)
@@ -1643,12 +1694,11 @@ async def alphapay_webhook(request: Request):
     if not signature or not timestamp:
         raise HTTPException(status_code=401, detail="Missing AlphaPay webhook signature")
     try:
-        sent_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        if sent_at.tzinfo is None:
-            sent_at = sent_at.replace(tzinfo=timezone.utc)
-        if abs((datetime.now(timezone.utc) - sent_at.astimezone(timezone.utc)).total_seconds()) > 300:
+        # AlphaPay sends X-Webhook-Timestamp as a Unix timestamp in seconds.
+        sent_at_seconds = int(timestamp)
+        if abs(datetime.now(timezone.utc).timestamp() - sent_at_seconds) > 300:
             raise HTTPException(status_code=401, detail="Expired AlphaPay webhook")
-    except ValueError:
+    except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid AlphaPay webhook timestamp")
     expected = hmac.new(secret.encode(), timestamp.encode() + b"." + raw, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
@@ -1659,7 +1709,7 @@ async def alphapay_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
     event_name = str(event.get("event") or "").lower()
     data = event.get("data") if isinstance(event.get("data"), dict) else event
-    reference = str(data.get("reference") or data.get("merchant_reference") or "")
+    reference = str(data.get("id") or data.get("reference") or data.get("merchant_reference") or "")
     state = str(data.get("status") or "").lower()
     if event_name in ("transaction.success", "payment.success", "payment.succeeded") or state in ("success", "successful", "succeeded", "completed", "paid"):
         try:
@@ -1669,7 +1719,14 @@ async def alphapay_webhook(request: Request):
         await _complete_alphapay_deposit(reference, amount, str(data.get("currency") or "GHS"))
     elif event_name in ("transaction.failed", "transaction.cancelled", "payment.failed", "payment.cancelled") or state in ("failed", "cancelled", "canceled", "rejected", "expired"):
         await db.transactions.update_one(
-            {"type": "deposit", "gateway": "alphapay", "gateway_reference": reference, "status": "pending"},
+            {
+                "type": "deposit", "gateway": "alphapay", "status": "pending",
+                "$or": [
+                    {"gateway_reference": reference},
+                    {"alphapay_reference": reference},
+                    {"reference": reference},
+                ],
+            },
             {"$set": {"status": "failed", "provider_status": state or event_name}},
         )
     return {"received": True}
@@ -1952,8 +2009,8 @@ async def read_settings(user: dict = Depends(get_current_user)):
 @router.put("/admin/settings")
 async def update_settings(body: SettingsInput, admin: dict = Depends(require_admin)):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if "min_deposit" in updates and updates["min_deposit"] < 300:
-        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 300")
+    if "min_deposit" in updates and updates["min_deposit"] < 1:
+        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 1")
     if "min_withdrawal" in updates and updates["min_withdrawal"] < 3000:
         raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 3,000")
     if updates:
