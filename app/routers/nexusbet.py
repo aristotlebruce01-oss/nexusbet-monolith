@@ -519,6 +519,21 @@ async def get_settings() -> dict:
     doc = await db.settings.find_one({"_id": "global"})
     if not doc:
         return dict(DEFAULT_SETTINGS)
+
+    # One-time migration: older deployments persisted the previous GHS 300
+    # default in MongoDB. Move that legacy default to the new GHS 1 minimum.
+    # Preserve any other custom minimum configured by an administrator.
+    stored_minimum = doc.get("min_deposit", DEFAULT_SETTINGS["min_deposit"])
+    try:
+        if float(stored_minimum) == 300.0:
+            await db.settings.update_one(
+                {"_id": "global", "min_deposit": stored_minimum},
+                {"$set": {"min_deposit": 1.0}},
+            )
+            doc["min_deposit"] = 1.0
+    except (TypeError, ValueError):
+        pass
+
     result = {k: doc.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS}
     result["payment_methods"] = {
         key: {**DEFAULT_PAYMENT_METHODS[key], **(doc.get("payment_methods", {}).get(key, {}) or {})}
