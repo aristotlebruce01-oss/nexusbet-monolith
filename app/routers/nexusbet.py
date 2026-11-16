@@ -505,8 +505,8 @@ DEFAULT_PAYMENT_METHODS = {
 }
 
 DEFAULT_SETTINGS = {
-    "min_deposit": 5.0,
-    "min_withdrawal": 3000.0,
+    "min_deposit": 200.0,
+    "min_withdrawal": 1000.0,
     "first_deposit_bonus_cap": 100.0,
     "payment_methods": DEFAULT_PAYMENT_METHODS,
 }
@@ -520,17 +520,28 @@ async def get_settings() -> dict:
     if not doc:
         return dict(DEFAULT_SETTINGS)
 
-    # One-time migration: move the previous GHS 300 and temporary GHS 1
-    # minimums to AlphaPay's documented GHS 5 minimum.
+    # Migrate legacy minimums (temporary GHS 1, AlphaPay GHS 5,
+    # and the previous GHS 300 setting) to the current GHS 200 minimum.
     # Preserve any other custom minimum configured by an administrator.
     stored_minimum = doc.get("min_deposit", DEFAULT_SETTINGS["min_deposit"])
     try:
-        if float(stored_minimum) in (1.0, 300.0):
+        if float(stored_minimum) in (1.0, 5.0, 300.0):
             await db.settings.update_one(
                 {"_id": "global", "min_deposit": stored_minimum},
-                {"$set": {"min_deposit": 5.0}},
+                {"$set": {"min_deposit": 200.0}},
             )
-            doc["min_deposit"] = 5.0
+            doc["min_deposit"] = 200.0
+    except (TypeError, ValueError):
+        pass
+
+    stored_withdrawal_minimum = doc.get("min_withdrawal", DEFAULT_SETTINGS["min_withdrawal"])
+    try:
+        if float(stored_withdrawal_minimum) == 3000.0:
+            await db.settings.update_one(
+                {"_id": "global", "min_withdrawal": stored_withdrawal_minimum},
+                {"$set": {"min_withdrawal": 1000.0}},
+            )
+            doc["min_withdrawal"] = 1000.0
     except (TypeError, ValueError):
         pass
 
@@ -626,8 +637,8 @@ class WithdrawInput(BaseModel):
     phone_number: str = Field(min_length=7, max_length=25)
 
 class SettingsInput(BaseModel):
-    min_deposit: Optional[float] = Field(default=None, ge=5, le=1000000)
-    min_withdrawal: Optional[float] = Field(default=None, ge=3000, le=1000000)
+    min_deposit: Optional[float] = Field(default=None, ge=200, le=1000000)
+    min_withdrawal: Optional[float] = Field(default=None, ge=1000, le=1000000)
 
 class RoleInput(BaseModel):
     role: str
@@ -2024,10 +2035,10 @@ async def read_settings(user: dict = Depends(get_current_user)):
 @router.put("/admin/settings")
 async def update_settings(body: SettingsInput, admin: dict = Depends(require_admin)):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if "min_deposit" in updates and updates["min_deposit"] < 5:
-        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 5")
-    if "min_withdrawal" in updates and updates["min_withdrawal"] < 3000:
-        raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 3,000")
+    if "min_deposit" in updates and updates["min_deposit"] < 200:
+        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 200")
+    if "min_withdrawal" in updates and updates["min_withdrawal"] < 1000:
+        raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 1,000")
     if updates:
         await db.settings.update_one({"_id": "global"}, {"$set": updates}, upsert=True)
     return await get_settings()
@@ -2058,6 +2069,8 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
         raise HTTPException(status_code=404, detail="Transaction not found")
     if txn.get("type") not in ("deposit", "withdrawal"):
         raise HTTPException(status_code=400, detail="This transaction type cannot be reviewed here")
+    if txn.get("type") == "deposit":
+        raise HTTPException(status_code=409, detail="Deposits are verified and credited automatically by AlphaPay. Manual deposit review is disabled.")
     if txn.get("status") not in ("pending", "processing"):
         raise HTTPException(status_code=400, detail="Transaction has already been reviewed")
 
