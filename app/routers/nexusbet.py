@@ -16,6 +16,7 @@ import uuid
 import random
 import asyncio
 import logging
+import json
 import math
 import csv
 import requests
@@ -1440,11 +1441,19 @@ async def _alphapay_request(method: str, path: str, payload: Optional[dict] = No
 
     try:
         response = await asyncio.to_thread(_request)
+        # Keep the exact response body for diagnostics. Do not log request headers
+        # or API keys. AlphaPay response bodies can contain customer data, so
+        # restrict access to production logs and apply an appropriate retention policy.
+        raw_response_body = response.text or ""
         try:
-            parsed = response.json()
-            data = parsed if isinstance(parsed, dict) else {"message": str(parsed)[:500]}
-        except Exception:
-            data = {"message": (response.text or "")[:500]}
+            parsed = json.loads(raw_response_body) if raw_response_body else {}
+            data = parsed if isinstance(parsed, dict) else {"response": parsed}
+        except (TypeError, ValueError):
+            data = {"message": raw_response_body}
+        logging.getLogger(__name__).info(
+            "AlphaPay HTTP response method=%s path=%s http_status=%s raw_body=%s",
+            method, path, response.status_code, raw_response_body
+        )
     except requests.RequestException as exc:
         logger = logging.getLogger(__name__)
         logger.exception("AlphaPay network request failed (%s %s)", method, path)
@@ -1633,10 +1642,64 @@ async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
         "network": ALPHAPAY_NETWORKS[body.method],
         "metadata": {"nexusbet_reference": reference},
     }
+    # Structured outbound diagnostics: never include authorization headers, API
+    # keys, full MSISDNs, or other secrets in this record.
+    softpay_path = "/api/v1/payments/softpay/"
+    outbound_phone = str(payload.get("customer", {}).get("phone", ""))
+    if outbound_phone.startswith("+233"):
+        phone_format = "+233"
+        phone_prefix = "+233"
+    elif outbound_phone.startswith("233"):
+        phone_format = "233"
+        phone_prefix = "233"
+    elif outbound_phone.startswith("0"):
+        phone_format = "0"
+        phone_prefix = "0"
+    else:
+        phone_format = "other"
+        phone_prefix = outbound_phone[:2]
+    phone_digits = re.sub(r"\D", "", outbound_phone)
+    masked_phone = (
+        f"{phone_prefix}{'*' * max(0, len(outbound_phone) - len(phone_prefix) - 2)}{outbound_phone[-2:]}"
+        if outbound_phone else ""
+    )
+    outbound_metadata = payload.get("metadata")
+    outbound_reference = (
+        outbound_metadata.get("nexusbet_reference")
+        if isinstance(outbound_metadata, dict) else None
+    )
+    outbound_diagnostic = {
+        "event": "alphapay_softpay_outbound",
+        "method": "POST",
+        "target_path": softpay_path,
+        "network": payload.get("network"),
+        "phone": {
+            "format_prefix": phone_format,
+            "masked": masked_phone,
+            "character_length": len(outbound_phone),
+            "digit_count": len(phone_digits),
+        },
+        "payload_schema": {
+            "amount": {"type": type(payload.get("amount")).__name__},
+            "metadata": {
+                "type": type(outbound_metadata).__name__,
+                "keys": sorted(outbound_metadata.keys()) if isinstance(outbound_metadata, dict) else [],
+            },
+            "reference": {
+                "type": type(outbound_reference).__name__ if outbound_reference is not None else "NoneType",
+                "source": "metadata.nexusbet_reference",
+            },
+        },
+    }
+    logging.getLogger(__name__).info(
+        "AlphaPay outbound diagnostic %s",
+        json.dumps(outbound_diagnostic, sort_keys=True, separators=(",", ":")),
+    )
+
     try:
         result = await _alphapay_request(
             "POST",
-            "/api/v1/payments/softpay/",
+            softpay_path,
             payload,
             extra_headers={"Idempotency-Key": internal_id},
         )
@@ -1730,9 +1793,21 @@ async def alphapay_webhook(request: Request):
     if not hmac.compare_digest(signature, expected):
         raise HTTPException(status_code=401, detail="Invalid AlphaPay webhook signature")
     try:
-        event = await request.json()
+        event = json.loads(raw.decode("utf-8"))
+        if not isinstance(event, dict):
+            raise ValueError("Webhook JSON root must be an object")
     except Exception:
+        logging.getLogger(__name__).warning(
+            "AlphaPay webhook received a validly signed but invalid JSON body; byte_length=%s",
+            len(raw),
+        )
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
+    # Log only after signature and timestamp verification. This captures the
+    # exact provider event for reconciliation; protect logs because event data
+    # may include customer identifiers. Never log the webhook signature/secret.
+    logging.getLogger(__name__).info(
+        "AlphaPay verified webhook received raw_body=%s", raw.decode("utf-8", errors="replace")
+    )
     event_name = str(event.get("event") or "").lower()
     data = event.get("data") if isinstance(event.get("data"), dict) else event
     reference = str(data.get("id") or data.get("reference") or data.get("merchant_reference") or "")
