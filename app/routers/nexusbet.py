@@ -545,22 +545,18 @@ async def get_settings() -> dict:
                 {"$set": {"min_deposit_migrated_to_30": True}},
             )
 
-    stored_withdrawal_minimum = doc.get("min_withdrawal", DEFAULT_SETTINGS["min_withdrawal"])
-    try:
-        if float(stored_withdrawal_minimum) == 3000.0:
-            await db.settings.update_one(
-                {"_id": "global", "min_withdrawal": stored_withdrawal_minimum},
-                {"$set": {"min_withdrawal": 1000.0}},
-            )
-            doc["min_withdrawal"] = 1000.0
-    except (TypeError, ValueError):
-        pass
-
     result = {k: doc.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS}
-    result["payment_methods"] = {
-        key: {**DEFAULT_PAYMENT_METHODS[key], **(doc.get("payment_methods", {}).get(key, {}) or {})}
-        for key in DEFAULT_PAYMENT_METHODS
-    }
+    # Be defensive about legacy or malformed database values. A missing/None
+    # payment_methods object (or a non-dict entry) must not break settings reads.
+    stored_payment_methods = doc.get("payment_methods")
+    if not isinstance(stored_payment_methods, dict):
+        stored_payment_methods = {}
+    result["payment_methods"] = {}
+    for key, defaults in DEFAULT_PAYMENT_METHODS.items():
+        stored_method = stored_payment_methods.get(key)
+        if not isinstance(stored_method, dict):
+            stored_method = {}
+        result["payment_methods"][key] = {**defaults, **stored_method}
     return result
 
 
@@ -651,7 +647,7 @@ class WithdrawInput(BaseModel):
 
 class SettingsInput(BaseModel):
     min_deposit: Optional[float] = Field(default=None, ge=0.01, le=1000000)
-    min_withdrawal: Optional[float] = Field(default=None, ge=1000, le=1000000)
+    min_withdrawal: Optional[float] = Field(default=None, ge=0.01, le=1000000)
 
 class RoleInput(BaseModel):
     role: str
@@ -1373,6 +1369,8 @@ def txn_public(d: dict) -> dict:
         "status": d["status"], "reference": d.get("reference"), "created_at": d["created_at"],
         "reviewed_at": d.get("reviewed_at"), "reviewed_by": d.get("reviewed_by"),
         "review_reason": d.get("review_reason"), "destination": d.get("destination"),
+        "payout_status": d.get("payout_status"), "payout_id": d.get("payout_id"),
+        "payout_error": d.get("payout_error"),
         "sender_name": d.get("sender_name"), "sender_phone": d.get("sender_phone"),
         "sender_account_name": d.get("sender_account_name"), "transaction_reference": d.get("transaction_reference"),
         "proof_data_url": d.get("proof_data_url"), "audit_history": d.get("audit_history", []),
@@ -1390,7 +1388,11 @@ async def wallet_status(user: dict = Depends(get_current_user)):
     ]).to_list(1)
     deposit_count = int(deposit_count_result[0]["count"] if deposit_count_result else 0)
     deposits_required = 3
-    deposits_remaining = max(0, deposits_required - deposit_count)
+    # Staff accounts are exempt from the three-approved-deposit rule in the
+    # withdrawal endpoint too. Keep the real deposit_count for display/audit,
+    # but do not block staff in the wallet status response.
+    is_staff = user.get("role", "user") in STAFF_ROLES
+    deposits_remaining = 0 if is_staff else max(0, deposits_required - deposit_count)
     can_withdraw = fresh.get("balance", 0.0) >= s["min_withdrawal"] and deposits_remaining == 0
     reserved = await db.transactions.aggregate([
         {"$match": {"user_id": str(user["_id"]), "type": "withdrawal", "status": {"$in": ["pending", "processing"]}}},
@@ -1442,6 +1444,15 @@ async def _alphapay_request(method: str, path: str, payload: Optional[dict] = No
     if extra_headers:
         headers.update(extra_headers)
 
+    # Optional static outbound proxy for all AlphaPay HTTP traffic.
+    # requests uses a scheme-to-proxy mapping for its `proxies` argument.
+    # Leave it unset to preserve the existing direct-connection behavior.
+    static_proxy_url = os.getenv("STATIC_PROXY_URL", "").strip()
+    request_proxies = (
+        {"http": static_proxy_url, "https": static_proxy_url}
+        if static_proxy_url else None
+    )
+
     def _request():
         return requests.request(
             method,
@@ -1449,6 +1460,7 @@ async def _alphapay_request(method: str, path: str, payload: Optional[dict] = No
             headers=headers,
             json=payload,
             timeout=30,
+            proxies=request_proxies,
         )
 
     try:
@@ -1491,6 +1503,38 @@ async def _alphapay_request(method: str, path: str, payload: Optional[dict] = No
             logger.error("AlphaPay business rejection: %s", str(message)[:300])
             raise HTTPException(status_code=502, detail=f"AlphaPay rejected the request: {str(message)[:300]}")
     return data if isinstance(data, dict) else {}
+
+
+# AlphaPay payout API. Set ALPHAPAY_BASE_URL to the provider's sandbox base URL
+# when testing; production defaults to https://api.alphapay.me.
+ALPHAPAY_PAYOUT_INITIALIZE_PATH = os.getenv(
+    "ALPHAPAY_PAYOUT_INITIALIZE_PATH", "/api/v1/payouts/initialize"
+)
+ALPHAPAY_PAYOUT_STATUS_PATH = os.getenv(
+    "ALPHAPAY_PAYOUT_STATUS_PATH", "/api/v1/payouts/{payout_id}"
+)
+
+
+async def trigger_alphapay_payout(payload: dict, idempotency_key: str) -> dict:
+    """Create one AlphaPay payout using the shared requests+STATIC_PROXY_URL helper."""
+    try:
+        parsed_key = uuid.UUID(str(idempotency_key))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="A valid UUID idempotency key is required") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise HTTPException(status_code=400, detail="A valid payout payload is required")
+    return await _alphapay_request(
+        "POST", ALPHAPAY_PAYOUT_INITIALIZE_PATH, payload,
+        extra_headers={"Idempotency-Key": str(parsed_key)},
+    )
+
+
+async def get_alphapay_payout_status(payout_id: str) -> dict:
+    payout_id = str(payout_id or "").strip()
+    if not payout_id:
+        raise HTTPException(status_code=400, detail="AlphaPay payout ID is required")
+    path = ALPHAPAY_PAYOUT_STATUS_PATH.format(payout_id=quote(payout_id, safe=""))
+    return await _alphapay_request("GET", path)
 
 
 def _alphapay_payload_data(payload: dict) -> dict:
@@ -1850,6 +1894,82 @@ async def legacy_manual_deposit_rejected(request: Request):
     raise HTTPException(status_code=410, detail="Manual deposits are disabled. Use the automatic mobile money checkout.")
 
 
+def _alphapay_payout_state(payload: dict) -> str:
+    data = _alphapay_payload_data(payload)
+    return str(
+        data.get("status") or data.get("payout_status") or data.get("transaction_status")
+        or payload.get("status") or "pending"
+    ).strip().lower()
+
+
+async def _apply_alphapay_payout_status(txn: dict, provider_payload: dict, reviewed_by: str = "system") -> dict:
+    """Persist a provider status exactly once; failed payouts refund the reserved wallet amount."""
+    data = _alphapay_payload_data(provider_payload)
+    provider_state = _alphapay_payout_state(provider_payload)
+    provider_id = str(
+        data.get("id") or data.get("payout_id") or data.get("payoutId")
+        or data.get("transaction_id") or txn.get("payout_id") or ""
+    ).strip()
+    now = datetime.now(timezone.utc).isoformat()
+    success_states = {"success", "successful", "succeeded", "completed", "paid"}
+    failure_states = {"failed", "failure", "rejected", "cancelled", "canceled", "declined", "expired"}
+
+    if provider_state in success_states:
+        update = await db.transactions.update_one(
+            {"id": txn["id"], "type": "withdrawal", "status": "processing", "payout_status": {"$ne": "success"}},
+            {"$set": {"status": "paid", "payout_status": "success", "provider_status": provider_state,
+                      "payout_id": provider_id or txn.get("payout_id"), "paid_at": now,
+                      "payout_response": provider_payload, "reviewed_by": reviewed_by}},
+        )
+        fresh = await db.transactions.find_one({"id": txn["id"]})
+        return {"status": fresh.get("status", "processing"), "payout_status": fresh.get("payout_status", provider_state),
+                "payout_id": fresh.get("payout_id"), "provider": data}
+
+    if provider_state in failure_states:
+        session = await client.start_session()
+        try:
+            async with session.start_transaction():
+                fresh = await db.transactions.find_one(
+                    {"id": txn["id"], "type": "withdrawal", "status": "processing", "refunded": {"$ne": True}},
+                    session=session,
+                )
+                if fresh:
+                    changed = await db.transactions.update_one(
+                        {"id": txn["id"], "status": "processing", "refunded": {"$ne": True}},
+                        {"$set": {"status": "failed", "payout_status": "failed", "provider_status": provider_state,
+                                  "payout_id": provider_id or txn.get("payout_id"), "payout_response": provider_payload,
+                                  "payout_failed_at": now, "refunded": True}},
+                        session=session,
+                    )
+                    if changed.modified_count == 1:
+                        await db.users.update_one(
+                            {"_id": ObjectId(fresh["user_id"])},
+                            {"$inc": {"balance": round(float(fresh["amount"]), 2)}},
+                            session=session,
+                        )
+                        await db.audit_logs.insert_one({
+                            "type": "withdrawal", "action": "alphapay_payout_failed_refunded",
+                            "transaction_id": txn["id"], "user_id": fresh["user_id"],
+                            "amount": fresh["amount"], "provider_status": provider_state, "at": now,
+                        }, session=session)
+        finally:
+            await session.end_session()
+        fresh = await db.transactions.find_one({"id": txn["id"]})
+        return {"status": fresh.get("status", "failed"), "payout_status": fresh.get("payout_status", "failed"),
+                "payout_id": fresh.get("payout_id"), "provider": data}
+
+    # PENDING / PROCESSING / INITIATED / UNKNOWN remain reserved and are never marked paid.
+    await db.transactions.update_one(
+        {"id": txn["id"], "type": "withdrawal", "status": "processing"},
+        {"$set": {"payout_status": provider_state or "pending", "provider_status": provider_state or "pending",
+                  "payout_id": provider_id or txn.get("payout_id"), "payout_response": provider_payload,
+                  "payout_last_checked_at": now}},
+    )
+    fresh = await db.transactions.find_one({"id": txn["id"]})
+    return {"status": fresh.get("status", "processing"), "payout_status": fresh.get("payout_status", provider_state),
+            "payout_id": fresh.get("payout_id"), "provider": data}
+
+
 @router.post("/wallet/withdraw")
 async def withdraw(body: WithdrawInput, user: dict = Depends(get_current_user)):
     if not math.isfinite(body.amount):
@@ -1861,13 +1981,16 @@ async def withdraw(body: WithdrawInput, user: dict = Depends(get_current_user)):
     if body.amount < s["min_withdrawal"]:
         raise HTTPException(status_code=400, detail=f"Minimum withdrawal is GHS {s['min_withdrawal']:.0f}")
 
-    deposit_count_result = await db.transactions.aggregate([
-        {"$match": {"user_id": str(user["_id"]), "type": "deposit", "status": {"$in": ["approved", "credited"]}}},
-        {"$count": "count"},
-    ]).to_list(1)
-    deposit_count = int(deposit_count_result[0]["count"] if deposit_count_result else 0)
-    if deposit_count < 3:
-        raise HTTPException(status_code=400, detail="MAKE 3 MORE DEPOSIT BEFORE YOU CAN WITHDRAW YOUR WINNINGS")
+    # The three-approved-deposit rule applies only to regular customer accounts.
+    # Admin, Super Admin, and Sub-Admin accounts are staff and are exempt.
+    if user.get("role", "user") not in STAFF_ROLES:
+        deposit_count_result = await db.transactions.aggregate([
+            {"$match": {"user_id": str(user["_id"]), "type": "deposit", "status": {"$in": ["approved", "credited"]}}},
+            {"$count": "count"},
+        ]).to_list(1)
+        deposit_count = int(deposit_count_result[0]["count"] if deposit_count_result else 0)
+        if deposit_count < 3:
+            raise HTTPException(status_code=400, detail="MAKE 3 MORE DEPOSIT BEFORE YOU CAN WITHDRAW YOUR WINNINGS")
 
     # Reserve the amount atomically so two simultaneous requests cannot
     # spend the same available balance. The amount remains reserved while
@@ -2124,8 +2247,8 @@ async def update_settings(body: SettingsInput, admin: dict = Depends(require_adm
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if "min_deposit" in updates and updates["min_deposit"] < 0.01:
         raise HTTPException(status_code=400, detail="Minimum deposit must be at least GHS 0.01")
-    if "min_withdrawal" in updates and updates["min_withdrawal"] < 1000:
-        raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 1,000")
+    if "min_withdrawal" in updates and updates["min_withdrawal"] < 0.01:
+        raise HTTPException(status_code=400, detail="Minimum withdrawal must be at least GHS 0.01")
     if updates:
         if "min_deposit" in updates:
             updates["min_deposit_migrated_to_30"] = True
@@ -2160,8 +2283,10 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
         raise HTTPException(status_code=400, detail="This transaction type cannot be reviewed here")
     if txn.get("type") == "deposit":
         raise HTTPException(status_code=409, detail="Deposits are verified and credited automatically by AlphaPay. Manual deposit review is disabled.")
-    if txn.get("status") not in ("pending", "processing"):
-        raise HTTPException(status_code=400, detail="Transaction has already been reviewed")
+    # Withdrawal approvals/rejections must start from PENDING only. PROCESSING
+    # means a provider request may already be in flight; never issue another payout.
+    if txn.get("status") != "pending":
+        raise HTTPException(status_code=409, detail="Transaction is already processing or has been reviewed")
 
     user_id = txn.get("user_id")
     amount = txn.get("amount")
@@ -2239,25 +2364,96 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
             await session.end_session()
         return {"ok": True, "status": "approved", "credited_amount": round(float(amount) + bonus_amount, 2), "bonus_amount": round(bonus_amount, 2)}
 
-    # Existing withdrawal review flow.
+    # Withdrawal review flow: claim PENDING -> PROCESSING atomically before
+    # contacting AlphaPay. A second admin click cannot pass this compare-and-set.
     if action == "approve":
-        result = await db.transactions.update_one(
-            {"id": transaction_id, "status": {"$in": ["pending", "processing"]}},
-            {"$set": {"status": "paid", "reviewed_at": reviewed_at, "reviewed_by": str(staff["_id"]), "review_reason": reason}, "$push": {"audit_history": audit_entry}},
+        idempotency_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"nexusbet:alphapay:payout:{transaction_id}"))
+        # Validate local payout details before claiming the transaction, so a
+        # malformed phone/network does not leave a withdrawal stuck PROCESSING.
+        phone_raw = str(txn.get("phone_number") or txn.get("destination") or "").strip()
+        phone_digits = re.sub(r"\D", "", phone_raw)
+        if phone_digits.startswith("0") and len(phone_digits) == 10:
+            phone_digits = "233" + phone_digits[1:]
+        if not (phone_digits.startswith("233") and len(phone_digits) == 12):
+            raise HTTPException(status_code=400, detail="Withdrawal has an invalid Ghana mobile number; payout was not sent")
+        network = ALPHAPAY_NETWORKS.get(str(txn.get("method") or "mtn").lower())
+        if not network:
+            raise HTTPException(status_code=400, detail="Unsupported AlphaPay payout network; payout was not sent")
+        claimed = await db.transactions.find_one_and_update(
+            {"id": transaction_id, "type": "withdrawal", "status": "pending"},
+            {"$set": {"status": "processing", "payout_status": "initiating",
+                      "payout_idempotency_key": idempotency_key, "reviewed_at": reviewed_at,
+                      "reviewed_by": str(staff["_id"]), "review_reason": reason},
+             "$push": {"audit_history": audit_entry}},
+            return_document=ReturnDocument.AFTER,
         )
-        if result.modified_count != 1:
-            raise HTTPException(status_code=409, detail="Transaction was already reviewed")
-        return {"ok": True, "status": "paid"}
+        if not claimed:
+            raise HTTPException(status_code=409, detail="Withdrawal is already processing or has been reviewed")
+
+        payout_phone = "+" + phone_digits
+        payout_user = await db.users.find_one({"_id": ObjectId(user_id)})
+        full_name = str((payout_user or {}).get("name") or (payout_user or {}).get("full_name") or "NexusBet customer").strip()
+        name_parts = full_name.split()
+        payout_payload = {
+            "amount": f"{float(amount):.2f}",
+            "currency": "GHS",
+            "country": "GH",
+            "method": network,
+            # Match AlphaPay's customer object shape already used by NexusBet's
+            # AlphaPay mobile-money deposit integration.
+            "customer": {
+                "phone": payout_phone,
+                "first_name": name_parts[0] if name_parts else "NexusBet",
+                "last_name": " ".join(name_parts[1:]) if len(name_parts) > 1 else "Customer",
+                "email": (payout_user or {}).get("email"),
+            },
+        }
+        # Do not release funds on timeout/unknown response: AlphaPay may have
+        # accepted the payout. Reconcile using the status endpoint and same key.
+        try:
+            provider_result = await trigger_alphapay_payout(payout_payload, idempotency_key)
+        except HTTPException as exc:
+            await db.transactions.update_one(
+                {"id": transaction_id, "status": "processing"},
+                {"$set": {"payout_status": "unknown", "payout_error": str(exc.detail),
+                          "payout_idempotency_key": idempotency_key}},
+            )
+            raise HTTPException(status_code=502, detail="AlphaPay payout outcome is not confirmed. The withdrawal remains processing; check payout status before retrying.") from exc
+
+        result = await _apply_alphapay_payout_status(claimed, provider_result, str(staff["_id"]))
+        await db.audit_logs.insert_one({
+            "type": "withdrawal", "action": "alphapay_payout_initialized",
+            "transaction_id": transaction_id, "user_id": user_id, "amount": float(amount),
+            "reviewed_by": str(staff["_id"]), "payout_id": result.get("payout_id"),
+            "payout_status": result.get("payout_status"), "at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"ok": True, **result, "message": "AlphaPay payout request submitted; final status may require confirmation."}
 
     result = await db.transactions.update_one(
-        {"id": transaction_id, "status": {"$in": ["pending", "processing"]}},
+        {"id": transaction_id, "type": "withdrawal", "status": "pending"},
         {"$set": {"status": "rejected", "reviewed_at": reviewed_at, "reviewed_by": str(staff["_id"]), "review_reason": reason}, "$push": {"audit_history": audit_entry}},
     )
     if result.modified_count != 1:
         raise HTTPException(status_code=409, detail="Transaction was already reviewed")
-    # Withdrawal amounts are deducted at request time; return them on rejection.
+    # Withdrawal amounts are deducted at request time; return them once on rejection.
     await db.users.update_one({"_id": ObjectId(user_id)}, {"$inc": {"balance": float(amount)}})
     return {"ok": True, "status": "rejected"}
+
+
+@router.get("/admin/transactions/{transaction_id}/payout-status")
+async def refresh_alphapay_payout_status(transaction_id: str, staff: dict = Depends(require_admin)):
+    txn = await db.transactions.find_one({"id": transaction_id, "type": "withdrawal"})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Withdrawal transaction not found")
+    if txn.get("status") in ("paid", "failed", "rejected"):
+        return {"ok": True, "status": txn.get("status"), "payout_status": txn.get("payout_status"),
+                "payout_id": txn.get("payout_id"), "message": "Withdrawal already has a final status."}
+    payout_id = txn.get("payout_id")
+    if not payout_id:
+        raise HTTPException(status_code=409, detail="AlphaPay has not returned a payout ID yet. Keep this withdrawal processing and contact AlphaPay if the request timed out.")
+    provider_result = await get_alphapay_payout_status(payout_id)
+    result = await _apply_alphapay_payout_status(txn, provider_result, str(staff["_id"]))
+    return {"ok": True, **result}
 
 
 @router.get("/admin/users")
