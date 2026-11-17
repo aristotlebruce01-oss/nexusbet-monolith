@@ -506,7 +506,7 @@ DEFAULT_PAYMENT_METHODS = {
 }
 
 DEFAULT_SETTINGS = {
-    "min_deposit": 200.0,
+    "min_deposit": 30.0,
     "min_withdrawal": 1000.0,
     "first_deposit_bonus_cap": 100.0,
     "payment_methods": DEFAULT_PAYMENT_METHODS,
@@ -521,19 +521,22 @@ async def get_settings() -> dict:
     if not doc:
         return dict(DEFAULT_SETTINGS)
 
-    # Migrate legacy minimums (temporary GHS 1, AlphaPay GHS 5,
-    # and the previous GHS 300 setting) to the current GHS 200 minimum.
-    # Preserve any other custom minimum configured by an administrator.
+    # Apply the requested GHS 30 minimum to installations still carrying
+    # the previous GHS 200 default or known temporary legacy values.
+    # Preserve other administrator-configured minimums.
     stored_minimum = doc.get("min_deposit", DEFAULT_SETTINGS["min_deposit"])
-    try:
-        if float(stored_minimum) in (1.0, 5.0, 300.0):
+    if not doc.get("min_deposit_g30_migrated", False):
+        try:
+            migration_updates = {"min_deposit_g30_migrated": True}
+            if float(stored_minimum) in (1.0, 5.0, 200.0, 300.0):
+                migration_updates["min_deposit"] = 30.0
+                doc["min_deposit"] = 30.0
             await db.settings.update_one(
-                {"_id": "global", "min_deposit": stored_minimum},
-                {"$set": {"min_deposit": 200.0}},
+                {"_id": "global"},
+                {"$set": migration_updates},
             )
-            doc["min_deposit"] = 200.0
-    except (TypeError, ValueError):
-        pass
+        except (TypeError, ValueError):
+            pass
 
     stored_withdrawal_minimum = doc.get("min_withdrawal", DEFAULT_SETTINGS["min_withdrawal"])
     try:
@@ -638,7 +641,7 @@ class WithdrawInput(BaseModel):
     phone_number: str = Field(min_length=7, max_length=25)
 
 class SettingsInput(BaseModel):
-    min_deposit: Optional[float] = Field(default=None, ge=200, le=1000000)
+    min_deposit: Optional[float] = Field(default=None, ge=30, le=1000000)
     min_withdrawal: Optional[float] = Field(default=None, ge=1000, le=1000000)
 
 class RoleInput(BaseModel):
@@ -2109,12 +2112,18 @@ async def read_settings(user: dict = Depends(get_current_user)):
 
 @router.put("/admin/settings")
 async def update_settings(body: SettingsInput, admin: dict = Depends(require_admin)):
+    # Run any one-time legacy settings migration before applying this admin edit.
+    await get_settings()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if "min_deposit" in updates and updates["min_deposit"] < 200:
-        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 200")
+    if "min_deposit" in updates and updates["min_deposit"] < 30:
+        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 30")
     if "min_withdrawal" in updates and updates["min_withdrawal"] < 1000:
         raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 1,000")
     if updates:
+        # Mark the one-time GHS 30 migration complete so an administrator can
+        # later intentionally choose GHS 200 (or another value) without it
+        # being mistaken for the old default on subsequent reads.
+        updates["min_deposit_g30_migrated"] = True
         await db.settings.update_one({"_id": "global"}, {"$set": updates}, upsert=True)
     return await get_settings()
 
