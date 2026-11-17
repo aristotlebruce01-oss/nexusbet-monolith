@@ -521,22 +521,28 @@ async def get_settings() -> dict:
     if not doc:
         return dict(DEFAULT_SETTINGS)
 
-    # Apply the requested GHS 30 minimum to installations still carrying
-    # the previous GHS 200 default or known temporary legacy values.
-    # Preserve other administrator-configured minimums.
-    stored_minimum = doc.get("min_deposit", DEFAULT_SETTINGS["min_deposit"])
-    if not doc.get("min_deposit_g30_migrated", False):
+    # One-time migration: move the previous production defaults to GHS 30.
+    # The marker prevents a future administrator choice of GHS 200 (or any
+    # other value) from being overwritten on subsequent settings reads.
+    if not doc.get("min_deposit_migrated_to_30", False):
+        stored_minimum = doc.get("min_deposit", 200.0)
         try:
-            migration_updates = {"min_deposit_g30_migrated": True}
             if float(stored_minimum) in (1.0, 5.0, 200.0, 300.0):
-                migration_updates["min_deposit"] = 30.0
+                await db.settings.update_one(
+                    {"_id": "global", "min_deposit_migrated_to_30": {"$ne": True}},
+                    {"$set": {"min_deposit": 30.0, "min_deposit_migrated_to_30": True}},
+                )
                 doc["min_deposit"] = 30.0
-            await db.settings.update_one(
-                {"_id": "global"},
-                {"$set": migration_updates},
-            )
+            else:
+                await db.settings.update_one(
+                    {"_id": "global", "min_deposit_migrated_to_30": {"$ne": True}},
+                    {"$set": {"min_deposit_migrated_to_30": True}},
+                )
         except (TypeError, ValueError):
-            pass
+            await db.settings.update_one(
+                {"_id": "global", "min_deposit_migrated_to_30": {"$ne": True}},
+                {"$set": {"min_deposit_migrated_to_30": True}},
+            )
 
     stored_withdrawal_minimum = doc.get("min_withdrawal", DEFAULT_SETTINGS["min_withdrawal"])
     try:
@@ -2112,18 +2118,14 @@ async def read_settings(user: dict = Depends(get_current_user)):
 
 @router.put("/admin/settings")
 async def update_settings(body: SettingsInput, admin: dict = Depends(require_admin)):
-    # Run any one-time legacy settings migration before applying this admin edit.
-    await get_settings()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if "min_deposit" in updates and updates["min_deposit"] < 30:
         raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 30")
     if "min_withdrawal" in updates and updates["min_withdrawal"] < 1000:
         raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 1,000")
     if updates:
-        # Mark the one-time GHS 30 migration complete so an administrator can
-        # later intentionally choose GHS 200 (or another value) without it
-        # being mistaken for the old default on subsequent reads.
-        updates["min_deposit_g30_migrated"] = True
+        if "min_deposit" in updates:
+            updates["min_deposit_migrated_to_30"] = True
         await db.settings.update_one({"_id": "global"}, {"$set": updates}, upsert=True)
     return await get_settings()
 
