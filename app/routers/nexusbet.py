@@ -647,7 +647,7 @@ class WithdrawInput(BaseModel):
     phone_number: str = Field(min_length=7, max_length=25)
 
 class SettingsInput(BaseModel):
-    min_deposit: Optional[float] = Field(default=None, ge=30, le=1000000)
+    min_deposit: Optional[float] = Field(default=None, ge=0.01, le=1000000)
     min_withdrawal: Optional[float] = Field(default=None, ge=1000, le=1000000)
 
 class RoleInput(BaseModel):
@@ -2119,8 +2119,8 @@ async def read_settings(user: dict = Depends(get_current_user)):
 @router.put("/admin/settings")
 async def update_settings(body: SettingsInput, admin: dict = Depends(require_admin)):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if "min_deposit" in updates and updates["min_deposit"] < 30:
-        raise HTTPException(status_code=400, detail="Minimum deposit cannot be below GHS 30")
+    if "min_deposit" in updates and updates["min_deposit"] < 0.01:
+        raise HTTPException(status_code=400, detail="Minimum deposit must be at least GHS 0.01")
     if "min_withdrawal" in updates and updates["min_withdrawal"] < 1000:
         raise HTTPException(status_code=400, detail="Minimum withdrawal cannot be below GHS 1,000")
     if updates:
