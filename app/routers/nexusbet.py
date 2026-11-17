@@ -24,6 +24,7 @@ import hmac
 import hashlib
 import io
 import re
+import base64
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Any
@@ -34,7 +35,7 @@ from bson import ObjectId
 from pymongo import UpdateOne, ReturnDocument
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends, Security, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
@@ -594,6 +595,8 @@ class EventInput(BaseModel):
     odds_draw: Optional[float] = Field(default=None, gt=1.0, le=1000)
     odds_away: float = Field(gt=1.0, le=1000)
     kickoff_at: Optional[datetime] = None
+    home_logo_url: Optional[str] = Field(default=None, max_length=2_800_000)
+    away_logo_url: Optional[str] = Field(default=None, max_length=2_800_000)
 
 class EventControlInput(BaseModel):
     status: Optional[Literal["open", "live", "paused", "finished", "cancelled"]] = None
@@ -2369,6 +2372,49 @@ def live_event_minute(doc: dict) -> int:
     return min(94, base + elapsed)
 
 
+def validate_uploaded_crest(value: Optional[str]) -> Optional[str]:
+    """Validate and retain small image data URLs in MongoDB (Render disk is ephemeral)."""
+    if value in (None, ""):
+        return None
+    match = re.fullmatch(r"data:(image/png|image/jpeg|image/webp);base64,([A-Za-z0-9+/]+={0,2})", value)
+    if not match:
+        raise HTTPException(status_code=400, detail="Team crest must be a PNG, JPG or WEBP image.")
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="The uploaded team crest is not a valid image.")
+    if not raw or len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Each team crest must be 2MB or smaller.")
+    mime = match.group(1)
+    valid_signature = (
+        (mime == "image/png" and raw.startswith(b"\x89PNG\r\n\x1a\n")) or
+        (mime == "image/jpeg" and raw.startswith(b"\xff\xd8\xff")) or
+        (mime == "image/webp" and len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP")
+    )
+    if not valid_signature:
+        raise HTTPException(status_code=400, detail="The file content does not match its image type.")
+    return value
+
+
+def event_crest_url(event_id: str, side: str) -> str:
+    return f"/events/{event_id}/crest/{side}"
+
+
+async def save_event_crest(event_id: str, side: str, data_url: Optional[str]) -> None:
+    key = f"{event_id}:{side}"
+    if not data_url:
+        await db.event_crests.delete_one({"_id": key})
+        return
+    header, encoded = data_url.split(",", 1)
+    mime = header[5:].split(";", 1)[0]
+    raw = base64.b64decode(encoded, validate=True)
+    await db.event_crests.update_one(
+        {"_id": key},
+        {"$set": {"content_type": mime, "data": raw, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+
+
 def event_public(doc: dict) -> dict:
     minute = live_event_minute(doc)
     return {
@@ -2400,7 +2446,8 @@ async def hydrate_event_team_assets(doc: dict) -> dict:
         return doc
     home = await team_asset(doc.get("home", ""), doc.get("league"))
     away = await team_asset(doc.get("away", ""), doc.get("league"))
-    updates = {"home_logo_url": home.get("logo_url"), "away_logo_url": away.get("logo_url"), "home_team_id": home.get("team_id"), "away_team_id": away.get("team_id")}
+    # Uploaded event-specific crests always take precedence over catalogue logos.
+    updates = {"home_logo_url": doc.get("home_logo_url") or home.get("logo_url"), "away_logo_url": doc.get("away_logo_url") or away.get("logo_url"), "home_team_id": home.get("team_id"), "away_team_id": away.get("team_id")}
     if any(v is not None for v in updates.values()):
         await db.events.update_one({"_id": doc["_id"]}, {"$set": updates})
         doc.update(updates)
@@ -2425,6 +2472,20 @@ async def league_detail(slug: str):
     if not teams:
         teams=[{"name":name,"logo_url":None,"provider_team_id":None} for name in league["teams"]]
     return {"slug":slug,"name":league["name"],"country":league["country"],"season":league["season"],"team_count":len(league["teams"]),"teams":[{"name":t.get("name"),"logo_url":t.get("logo_url"),"team_id":t.get("provider_team_id")} for t in teams]}
+
+@router.get("/events/{event_id}/crest/{side}")
+async def get_event_crest(event_id: str, side: str):
+    if side not in {"home", "away"}:
+        raise HTTPException(status_code=404, detail="Team crest not found")
+    crest = await db.event_crests.find_one({"_id": f"{event_id}:{side}"})
+    if not crest:
+        raise HTTPException(status_code=404, detail="Team crest not found")
+    return Response(
+        content=bytes(crest["data"]),
+        media_type=crest.get("content_type", "application/octet-stream"),
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
 
 @router.get("/events")
 async def list_events(sport: Optional[str] = None, q: Optional[str] = None,
@@ -2461,12 +2522,17 @@ async def events_meta():
 
 @router.post("/admin/events")
 async def create_event(body: EventInput, staff: dict = Depends(require_permission("events.manage"))):
+    uuid_event_id = uuid.uuid4()
+    home_crest = validate_uploaded_crest(body.home_logo_url)
+    away_crest = validate_uploaded_crest(body.away_logo_url)
     doc = {
-        "id": str(uuid.uuid4()),
+        "id": str(uuid_event_id),
         "sport": body.sport,
         "league": body.league,
         "home": body.home,
         "away": body.away,
+        "home_logo_url": event_crest_url(str(uuid_event_id), "home") if home_crest else None,
+        "away_logo_url": event_crest_url(str(uuid_event_id), "away") if away_crest else None,
         "odds_home": body.odds_home,
         "odds_draw": body.odds_draw if body.sport.strip().lower() not in {"basketball", "tennis"} else None,
         "odds_away": body.odds_away,
@@ -2482,6 +2548,10 @@ async def create_event(body: EventInput, staff: dict = Depends(require_permissio
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.events.insert_one(doc)
+    if home_crest:
+        await save_event_crest(doc["id"], "home", home_crest)
+    if away_crest:
+        await save_event_crest(doc["id"], "away", away_crest)
     doc = await hydrate_event_team_assets(doc)
     return event_public(doc)
 
@@ -2496,6 +2566,14 @@ async def update_event(event_id: str, body: EventInput, staff: dict = Depends(re
         "odds_away": round(body.odds_away, 2),
         "kickoff_at": body.kickoff_at.isoformat() if body.kickoff_at else None,
     }
+    if "home_logo_url" in body.model_fields_set:
+        home_crest = validate_uploaded_crest(body.home_logo_url)
+        await save_event_crest(event_id, "home", home_crest)
+        values["home_logo_url"] = event_crest_url(event_id, "home") if home_crest else None
+    if "away_logo_url" in body.model_fields_set:
+        away_crest = validate_uploaded_crest(body.away_logo_url)
+        await save_event_crest(event_id, "away", away_crest)
+        values["away_logo_url"] = event_crest_url(event_id, "away") if away_crest else None
     if not all(values[k] for k in ("sport", "league", "home", "away")):
         raise HTTPException(status_code=400, detail="Sport, league and team names are required")
     result = await db.events.update_one({"id": event_id}, {"$set": values})
@@ -2509,6 +2587,7 @@ async def update_event(event_id: str, body: EventInput, staff: dict = Depends(re
 @router.delete("/admin/events/{event_id}")
 async def delete_event(event_id: str, staff: dict = Depends(require_permission("events.manage"))):
     await db.events.delete_one({"id": event_id})
+    await db.event_crests.delete_many({"_id": {"$in": [f"{event_id}:home", f"{event_id}:away"]}})
     return {"ok": True}
 
 
