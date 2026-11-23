@@ -525,6 +525,28 @@ async def get_settings() -> dict:
     # One-time migration: move the previous production defaults to GHS 30.
     # The marker prevents a future administrator choice of GHS 200 (or any
     # other value) from being overwritten on subsequent settings reads.
+    # One-time migration: move the previous first-deposit bonus cap from GHS 100 to GHS 50.
+    # The marker preserves any later administrator-selected cap.
+    if not doc.get("first_deposit_bonus_migrated_to_50", False):
+        stored_bonus_cap = doc.get("first_deposit_bonus_cap", 100.0)
+        try:
+            if float(stored_bonus_cap) == 100.0:
+                await db.settings.update_one(
+                    {"_id": "global", "first_deposit_bonus_migrated_to_50": {"$ne": True}},
+                    {"$set": {"first_deposit_bonus_cap": 50.0, "first_deposit_bonus_migrated_to_50": True}},
+                )
+                doc["first_deposit_bonus_cap"] = 50.0
+            else:
+                await db.settings.update_one(
+                    {"_id": "global", "first_deposit_bonus_migrated_to_50": {"$ne": True}},
+                    {"$set": {"first_deposit_bonus_migrated_to_50": True}},
+                )
+        except (TypeError, ValueError):
+            await db.settings.update_one(
+                {"_id": "global", "first_deposit_bonus_migrated_to_50": {"$ne": True}},
+                {"$set": {"first_deposit_bonus_migrated_to_50": True}},
+            )
+
     if not doc.get("min_deposit_migrated_to_30", False):
         stored_minimum = doc.get("min_deposit", 200.0)
         try:
@@ -595,7 +617,7 @@ class EventInput(BaseModel):
     away_logo_url: Optional[str] = Field(default=None, max_length=2_800_000)
 
 class EventControlInput(BaseModel):
-    status: Optional[Literal["open", "live", "paused", "finished", "cancelled"]] = None
+    status: Optional[Literal["open", "live", "halftime", "paused", "finished", "cancelled"]] = None
     minute: Optional[int] = Field(default=None, ge=0, le=120)
     home_score: Optional[int] = Field(default=None, ge=0, le=99)
     away_score: Optional[int] = Field(default=None, ge=0, le=99)
@@ -686,13 +708,13 @@ class DepositCleanupInput(BaseModel):
 
 class BetInput(BaseModel):
     event_id: str = Field(min_length=1, max_length=100)
-    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft"] = "match_result"
+    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft", "both_teams_score"] = "match_result"
     selection: str = Field(min_length=1, max_length=80)
     stake: float = Field(gt=0, le=100000)
 
 class TicketSelection(BaseModel):
     event_id: str = Field(min_length=1, max_length=100)
-    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft"] = "match_result"
+    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft", "both_teams_score"] = "match_result"
     selection: str = Field(min_length=1, max_length=80)
 
 class TicketInput(BaseModel):
@@ -884,46 +906,79 @@ def bet_public(doc: dict, event: Optional[dict] = None) -> dict:
     }
 
 
-CORRECT_SCORE_ODDS = {
-    "0-0": 6.0, "1-0": 5.5, "0-1": 6.5, "1-1": 5.0,
-    "2-0": 7.0, "0-2": 8.0, "2-1": 8.0, "1-2": 8.5,
-    "2-2": 10.0, "3-0": 11.0, "0-3": 13.0, "3-1": 12.0,
-    "1-3": 14.0, "3-2": 16.0, "2-3": 17.0,
-}
+def _event_seed(event: dict) -> float:
+    value = str(event.get("id") or f"{event.get('home','')}-{event.get('away','')}-{event.get('start_time','')}")
+    h = 2166136261
+    for char in value:
+        h ^= ord(char)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h / 4294967295
 
-def selection_odds(event: dict, selection: str) -> float:
-    sport = str(event.get("sport", "Football")).strip().lower()
-    if selection not in {"home", "draw", "away"}:
-        raise HTTPException(status_code=400, detail="Selection must be home, draw, or away")
-    if sport in {"basketball", "tennis"} and selection == "draw":
-        raise HTTPException(status_code=400, detail=f"Draw odds are not available for {sport.title()}; choose a winner.")
-    defaults = {"home": 1.85, "draw": 3.40, "away": 3.75}
-    raw = {"home": event.get("odds_home"), "draw": event.get("odds_draw"), "away": event.get("odds_away")}[selection]
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        if sport in {"basketball", "tennis"} and selection == "draw":
-            raise HTTPException(status_code=400, detail="Draw odds are unavailable for this sport")
-        value = defaults[selection]
-    return value if value > 0 else defaults[selection]
+def _poisson(k: int, lam: float) -> float:
+    import math
+    factorial = math.factorial(k)
+    return math.exp(-lam) * (lam ** k) / factorial
+
+def _fixture_lambdas(event: dict):
+    import math
+    odds = []
+    for key, default in (("home",1.85),("draw",3.4),("away",4.2)):
+        value = event.get("odds", {}).get(key, event.get(f"odds_{key}", default))
+        try: value = float(value)
+        except (TypeError, ValueError): value = default
+        odds.append(max(1.01, value))
+    implied = [1/value for value in odds]
+    total = sum(implied) or 1
+    ph, _, pa = [value/total for value in implied]
+    balance = max(0.25, min(0.75, ph/(ph+pa or 1)))
+    seed = _event_seed(event)
+    total_goals = 2.35 + seed*0.55
+    return total_goals*balance, total_goals*(1-balance)
 
 def market_odds(event: dict, market: str, selection: str) -> float:
+    import math
     if market == "match_result":
         return selection_odds(event, selection)
-    if market == "double_chance":
-        aliases = {"dc_team_1": 1.25, "dc_team_2": 1.45, "1X": 1.25, "X2": 1.45}
-        if selection not in aliases:
-            raise HTTPException(status_code=400, detail="Unsupported double chance selection")
-        return aliases[selection]
+    home_lam, away_lam = _fixture_lambdas(event)
+    seed = _event_seed(event)
+    variation = 0.985 + seed*0.03
+    def price(probability):
+        return round(max(1.01, 1.08 / max(0.0005, probability) * variation), 2)
     if market == "correct_score":
-        if selection not in CORRECT_SCORE_ODDS:
+        try:
+            home_goals, away_goals = [int(part) for part in selection.split("-")]
+            if home_goals < 0 or away_goals < 0 or home_goals > 8 or away_goals > 8: raise ValueError
+        except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Unsupported correct score selection")
-        return CORRECT_SCORE_ODDS[selection]
+        return price(_poisson(home_goals, home_lam) * _poisson(away_goals, away_lam))
+    if market == "both_teams_score":
+        yes_probability = (1-math.exp(-home_lam)) * (1-math.exp(-away_lam))
+        return price(yes_probability if selection == "yes" else 1-yes_probability) if selection in {"yes", "no"} else (_ for _ in ()).throw(HTTPException(status_code=400, detail="Unsupported GG/NG selection"))
     if market == "ht_draw_ft":
-        aliases = {"home": 7.0, "draw": 5.0, "away": 7.5, "ht_draw_ft_home": 7.0, "ht_draw_ft_draw": 5.0, "ht_draw_ft_away": 7.5}
+        aliases = {"home":"home", "win1":"home", "ht_draw_ft_home":"home", "draw":"draw", "ht_draw_ft_draw":"draw", "away":"away", "win2":"away", "ht_draw_ft_away":"away"}
         if selection not in aliases:
             raise HTTPException(status_code=400, detail="Unsupported half-time/full-time selection")
-        return aliases[selection]
+        odds = []
+        for key, default in (("home",1.85),("draw",3.4),("away",4.2)):
+            try: value=float(event.get("odds",{}).get(key,event.get(f"odds_{key}",default)))
+            except (TypeError,ValueError): value=default
+            odds.append(max(1.01,value))
+        implied=[1/value for value in odds]
+        total=sum(implied) or 1
+        index={"home":0,"draw":1,"away":2}[aliases[selection]]
+        ht_draw=0.24+seed*0.08
+        return price(ht_draw*(implied[index]/total))
+    if market == "double_chance":
+        aliases = {"dc_team_1":"dc_team_1", "dc_team_2":"dc_team_2", "1X":"dc_team_1", "X2":"dc_team_2"}
+        if selection not in aliases:
+            raise HTTPException(status_code=400, detail="Unsupported double chance selection")
+        values=[]
+        for key, default in (("home",1.85),("draw",3.4),("away",4.2)):
+            try: values.append(1/max(1.01,float(event.get("odds",{}).get(key,event.get(f"odds_{key}",default)))))
+            except (TypeError,ValueError): values.append(1/default)
+        total=sum(values) or 1
+        probability=(values[0]+values[1] if aliases[selection]=="dc_team_1" else values[1]+values[2])/total
+        return round(max(1.01,1.04/probability),2)
     raise HTTPException(status_code=400, detail="Unsupported betting market")
 
 def selection_wins(bet: dict, event: dict, result: str) -> bool:
@@ -940,6 +995,10 @@ def selection_wins(bet: dict, event: dict, result: str) -> bool:
     if market == "correct_score":
         final_score = f"{int(event.get('home_score', 0))}-{int(event.get('away_score', 0))}"
         return selection == final_score
+    if market == "both_teams_score":
+        home_goals = int(event.get("home_score", 0) or 0)
+        away_goals = int(event.get("away_score", 0) or 0)
+        return (home_goals > 0 and away_goals > 0) if selection == "yes" else (home_goals == 0 or away_goals == 0) if selection == "no" else False
     if market == "ht_draw_ft":
         ht_home = event.get("halftime_home_score")
         ht_away = event.get("halftime_away_score")
@@ -1051,11 +1110,20 @@ async def control_event(event_id: str, body: EventControlInput, staff: dict = De
     # made by Admin before/while live are preserved.
     if requested_status == "live":
         # Resume from a paused minute; a fresh match starts at minute 1.
-        resume_minute = int(current.get("minute", 0) or 0) if current.get("status") == "paused" else 1
+        resume_minute = int(current.get("minute", 0) or 0) if current.get("status") in ("paused", "halftime") else 1
         values["minute"] = max(1, min(94, resume_minute))
         values["clock_base_minute"] = values["minute"]
         values["clock_started_at"] = datetime.now(timezone.utc).isoformat()
         values.pop("result", None)
+
+    if requested_status == "halftime":
+        # Freeze the live clock and preserve the exact score at the HT whistle.
+        ht_minute = live_event_minute(current)
+        values["minute"] = ht_minute
+        values["clock_base_minute"] = ht_minute
+        values["clock_started_at"] = None
+        values["halftime_home_score"] = int(current.get("home_score", 0) or 0)
+        values["halftime_away_score"] = int(current.get("away_score", 0) or 0)
 
     if requested_status == "paused":
         values["minute"] = live_event_minute(current)
@@ -1261,7 +1329,8 @@ async def place_ticket(booking_code:str, body:dict, user:dict=Depends(get_curren
         raise HTTPException(status_code=404, detail="Booking code not found or no longer available")
 
     stake=round(float(body.get("stake",0)),2)
-    if stake<=0: raise HTTPException(status_code=400, detail="Enter a valid stake")
+    if stake < 150:
+        raise HTTPException(status_code=400, detail="Minimum stake is GHS 150.00. Please enter a stake of GHS 150.00 or more to place bet.")
 
     # Do not allow a shared booking to be placed after any of its matches
     # have closed/finished. This protects all users using the same code.
@@ -2625,7 +2694,7 @@ def event_public(doc: dict) -> dict:
             "away": round(doc["odds_away"], 2),
         },
         "status": doc["status"],
-        "phase": "live" if doc.get("status") == "live" else ("paused" if doc.get("status") == "paused" else ("finished" if doc.get("status") == "finished" else "scheduled")),
+        "phase": "halftime" if doc.get("status") == "halftime" else ("live" if doc.get("status") == "live" else ("paused" if doc.get("status") == "paused" else ("finished" if doc.get("status") == "finished" else "scheduled"))),
         "minute": minute,
         "score": {"home": int(doc.get("home_score", 0) or 0), "away": int(doc.get("away_score", 0) or 0)},
         "halftime_score": {"home": doc.get("halftime_home_score"), "away": doc.get("halftime_away_score")},
