@@ -708,13 +708,13 @@ class DepositCleanupInput(BaseModel):
 
 class BetInput(BaseModel):
     event_id: str = Field(min_length=1, max_length=100)
-    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft", "both_teams_score"] = "match_result"
+    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft", "goals_over_under", "both_teams_score"] = "match_result"
     selection: str = Field(min_length=1, max_length=80)
     stake: float = Field(gt=0, le=100000)
 
 class TicketSelection(BaseModel):
     event_id: str = Field(min_length=1, max_length=100)
-    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft", "both_teams_score"] = "match_result"
+    market: Literal["match_result", "double_chance", "correct_score", "ht_draw_ft", "goals_over_under", "both_teams_score"] = "match_result"
     selection: str = Field(min_length=1, max_length=80)
 
 class TicketInput(BaseModel):
@@ -906,79 +906,67 @@ def bet_public(doc: dict, event: Optional[dict] = None) -> dict:
     }
 
 
-def _event_seed(event: dict) -> float:
-    value = str(event.get("id") or f"{event.get('home','')}-{event.get('away','')}-{event.get('start_time','')}")
-    h = 2166136261
-    for char in value:
-        h ^= ord(char)
-        h = (h * 16777619) & 0xFFFFFFFF
-    return h / 4294967295
-
-def _poisson(k: int, lam: float) -> float:
+CORRECT_SCORE_OPTIONS = {"0-0","1-0","0-1","1-1","2-0","0-2","2-1","1-2","2-2","3-0","0-3","3-1","1-3","3-2","2-3","3-3"}
+def _poisson(n: int, lam: float) -> float:
     import math
-    factorial = math.factorial(k)
-    return math.exp(-lam) * (lam ** k) / factorial
+    return math.exp(-lam) * (lam ** n) / math.factorial(n)
 
-def _fixture_lambdas(event: dict):
-    import math
-    odds = []
-    for key, default in (("home",1.85),("draw",3.4),("away",4.2)):
-        value = event.get("odds", {}).get(key, event.get(f"odds_{key}", default))
-        try: value = float(value)
-        except (TypeError, ValueError): value = default
-        odds.append(max(1.01, value))
-    implied = [1/value for value in odds]
-    total = sum(implied) or 1
-    ph, _, pa = [value/total for value in implied]
-    balance = max(0.25, min(0.75, ph/(ph+pa or 1)))
-    seed = _event_seed(event)
-    total_goals = 2.35 + seed*0.55
-    return total_goals*balance, total_goals*(1-balance)
+def _goal_lambdas(event: dict):
+    home = max(1.05, float(event.get("odds_home") or 1.9))
+    away = max(1.05, float(event.get("odds_away") or 3.6))
+    seed = sum(ord(c) for c in str(event.get("id") or f"{event.get('home')}-{event.get('away')}"))
+    total = 2.45 + ((seed % 13) - 6) * 0.025
+    strength = away / home
+    lh = max(0.65, min(2.35, total * (0.5 + 0.5 * strength / (1 + strength))))
+    return lh, max(0.45, total - lh)
+
+def _fixture_market_price(event: dict, selection: str) -> float:
+    import re
+    lh, la = _goal_lambdas(event); margin = 1.08
+    if selection in CORRECT_SCORE_OPTIONS:
+        h, a = map(int, selection.split("-")); prob = _poisson(h, lh) * _poisson(a, la)
+        return round(max(2.8, min(80.0, margin / max(prob, 0.0001))), 2)
+    if selection.startswith(("over_", "under_")):
+        line = float(selection.split("_")[1]); threshold = int(line)
+        over = sum(_poisson(h,lh)*_poisson(a,la) for h in range(6) for a in range(6) if h+a > threshold)
+        prob = over if selection.startswith("over_") else 1-over
+        return round(max(1.12, min(9.0, margin/max(prob,0.02))), 2)
+    if selection in {"yes", "no"}:
+        both=(1-__import__("math").exp(-lh))*(1-__import__("math").exp(-la))
+        return round(max(1.18,min(4.8,margin/max(both if selection=="yes" else 1-both,0.03))),2)
+    if selection in {"win1","win2"}:
+        seed=sum(ord(c) for c in str(event.get("id") or event.get("home","")))
+        return round((6.1+(seed%17)*0.11) if selection=="win1" else (6.4+(seed%19)*0.10),2)
+    raise HTTPException(status_code=400, detail="Unsupported selection")
+
+def selection_odds(event: dict, selection: str) -> float:
+    sport = str(event.get("sport", "Football")).strip().lower()
+    if selection not in {"home", "draw", "away"}:
+        raise HTTPException(status_code=400, detail="Selection must be home, draw, or away")
+    if sport in {"basketball", "tennis"} and selection == "draw":
+        raise HTTPException(status_code=400, detail=f"Draw odds are not available for {sport.title()}; choose a winner.")
+    defaults = {"home": 1.85, "draw": 3.40, "away": 3.75}
+    raw = {"home": event.get("odds_home"), "draw": event.get("odds_draw"), "away": event.get("odds_away")}[selection]
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        if sport in {"basketball", "tennis"} and selection == "draw":
+            raise HTTPException(status_code=400, detail="Draw odds are unavailable for this sport")
+        value = defaults[selection]
+    return value if value > 0 else defaults[selection]
 
 def market_odds(event: dict, market: str, selection: str) -> float:
-    import math
-    if market == "match_result":
-        return selection_odds(event, selection)
-    home_lam, away_lam = _fixture_lambdas(event)
-    seed = _event_seed(event)
-    variation = 0.985 + seed*0.03
-    def price(probability):
-        return round(max(1.01, 1.08 / max(0.0005, probability) * variation), 2)
-    if market == "correct_score":
-        try:
-            home_goals, away_goals = [int(part) for part in selection.split("-")]
-            if home_goals < 0 or away_goals < 0 or home_goals > 8 or away_goals > 8: raise ValueError
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Unsupported correct score selection")
-        return price(_poisson(home_goals, home_lam) * _poisson(away_goals, away_lam))
-    if market == "both_teams_score":
-        yes_probability = (1-math.exp(-home_lam)) * (1-math.exp(-away_lam))
-        return price(yes_probability if selection == "yes" else 1-yes_probability) if selection in {"yes", "no"} else (_ for _ in ()).throw(HTTPException(status_code=400, detail="Unsupported GG/NG selection"))
-    if market == "ht_draw_ft":
-        aliases = {"home":"home", "win1":"home", "ht_draw_ft_home":"home", "draw":"draw", "ht_draw_ft_draw":"draw", "away":"away", "win2":"away", "ht_draw_ft_away":"away"}
-        if selection not in aliases:
-            raise HTTPException(status_code=400, detail="Unsupported half-time/full-time selection")
-        odds = []
-        for key, default in (("home",1.85),("draw",3.4),("away",4.2)):
-            try: value=float(event.get("odds",{}).get(key,event.get(f"odds_{key}",default)))
-            except (TypeError,ValueError): value=default
-            odds.append(max(1.01,value))
-        implied=[1/value for value in odds]
-        total=sum(implied) or 1
-        index={"home":0,"draw":1,"away":2}[aliases[selection]]
-        ht_draw=0.24+seed*0.08
-        return price(ht_draw*(implied[index]/total))
+    if market == "match_result": return selection_odds(event, selection)
     if market == "double_chance":
-        aliases = {"dc_team_1":"dc_team_1", "dc_team_2":"dc_team_2", "1X":"dc_team_1", "X2":"dc_team_2"}
-        if selection not in aliases:
-            raise HTTPException(status_code=400, detail="Unsupported double chance selection")
-        values=[]
-        for key, default in (("home",1.85),("draw",3.4),("away",4.2)):
-            try: values.append(1/max(1.01,float(event.get("odds",{}).get(key,event.get(f"odds_{key}",default)))))
-            except (TypeError,ValueError): values.append(1/default)
-        total=sum(values) or 1
-        probability=(values[0]+values[1] if aliases[selection]=="dc_team_1" else values[1]+values[2])/total
-        return round(max(1.01,1.04/probability),2)
+        aliases = {"dc_team_1": 1.25, "dc_team_2": 1.45, "1X": 1.25, "X2": 1.45}
+        if selection not in aliases: raise HTTPException(status_code=400, detail="Unsupported double chance selection")
+        return aliases[selection]
+    if market == "correct_score" and selection not in CORRECT_SCORE_OPTIONS:
+        raise HTTPException(status_code=400, detail="Unsupported correct score selection")
+    if market == "ht_draw_ft" and selection not in {"home","draw","away","win1","win2","ht_draw_ft_home","ht_draw_ft_draw","ht_draw_ft_away"}:
+        raise HTTPException(status_code=400, detail="Unsupported half-time/full-time selection")
+    if market in {"correct_score","goals_over_under","both_teams_score","ht_draw_ft"}:
+        return _fixture_market_price(event, selection)
     raise HTTPException(status_code=400, detail="Unsupported betting market")
 
 def selection_wins(bet: dict, event: dict, result: str) -> bool:
@@ -996,9 +984,13 @@ def selection_wins(bet: dict, event: dict, result: str) -> bool:
         final_score = f"{int(event.get('home_score', 0))}-{int(event.get('away_score', 0))}"
         return selection == final_score
     if market == "both_teams_score":
-        home_goals = int(event.get("home_score", 0) or 0)
-        away_goals = int(event.get("away_score", 0) or 0)
-        return (home_goals > 0 and away_goals > 0) if selection == "yes" else (home_goals == 0 or away_goals == 0) if selection == "no" else False
+        both = int(event.get("home_score",0)) > 0 and int(event.get("away_score",0)) > 0
+        return both if selection == "yes" else not both if selection == "no" else False
+    if market == "goals_over_under":
+        total = int(event.get("home_score",0)) + int(event.get("away_score",0))
+        try: line = float(selection.split("_",1)[1])
+        except (ValueError, IndexError): return False
+        return total > line if selection.startswith("over_") else total < line if selection.startswith("under_") else False
     if market == "ht_draw_ft":
         ht_home = event.get("halftime_home_score")
         ht_away = event.get("halftime_away_score")
@@ -1249,18 +1241,38 @@ async def create_ticket(body: TicketInput, user: dict = Depends(get_current_user
     ids=[x.event_id for x in body.selections]
     if len(ids)!=len(set(ids)): raise HTTPException(status_code=400, detail="A ticket cannot contain the same match twice")
     selections=[]; total=1.0
+    supported_markets = {
+        "match_result", "double_chance", "correct_score",
+        "ht_draw_ft", "goals_over_under", "both_teams_score",
+    }
     for item in body.selections:
-        ev=await db.events.find_one({"id":item.event_id})
-        if not ev: raise HTTPException(status_code=404, detail=f"Match {item.event_id} not found")
-        if ev.get("status") not in ("open","scheduled","live"): raise HTTPException(status_code=400, detail="One of the selected matches is no longer open")
-        # Snapshot the exact odds at booking time. This value is returned with the
-        # booking code and is reused when that code is loaded later, so a booking
-        # never falls back to 1.00 or changes because the UI recalculates it.
-        odds=round(market_odds(ev,item.market,item.selection),2)
-        if odds <= 0:
-            raise HTTPException(status_code=400, detail="Odds unavailable for this selection")
-        total*=odds
-        selections.append({"event_id":item.event_id,"market":item.market,"selection":item.selection,"odds":odds,"status":"pending","result":None})
+        ev = await db.events.find_one({"id": item.event_id})
+        if not ev:
+            raise HTTPException(status_code=404, detail=f"Match {item.event_id} not found")
+        if ev.get("status") not in ("open", "scheduled", "live"):
+            raise HTTPException(status_code=400, detail=f"{ev.get('home', 'Selected match')} vs {ev.get('away', '')} is no longer open")
+        if item.market not in supported_markets:
+            raise HTTPException(status_code=400, detail=f"Unsupported market: {item.market}")
+        # Always validate and price the selection on the server. Never trust an
+        # odds value supplied by the browser; persist the same price used by the
+        # booking code and subsequent placement.
+        try:
+            odds = round(float(market_odds(ev, item.market, item.selection)), 2)
+        except HTTPException:
+            raise
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(status_code=400, detail=f"Invalid selection for {item.market}")
+        if not math.isfinite(odds) or odds <= 1.0:
+            raise HTTPException(status_code=400, detail=f"Odds unavailable for {item.market} selection {item.selection}")
+        total *= odds
+        selections.append({
+            "event_id": item.event_id,
+            "market": item.market,
+            "selection": item.selection,
+            "odds": odds,
+            "status": "pending",
+            "result": None,
+        })
     code=f"NBM-{uuid.uuid4().hex[:10].upper()}"; now=datetime.now(timezone.utc).isoformat()
     doc={"id":str(uuid.uuid4()),"booking_code":code,"user_id":str(user["_id"]),"selections":selections,"total_odds":round(total,2),"stake":0.0,"potential_win":0.0,"payout":0.0,"status":"booked","created_at":now}
     await db.tickets.insert_one(doc)
@@ -1328,9 +1340,14 @@ async def place_ticket(booking_code:str, body:dict, user:dict=Depends(get_curren
     if not template:
         raise HTTPException(status_code=404, detail="Booking code not found or no longer available")
 
-    stake=round(float(body.get("stake",0)),2)
-    if stake < 150:
-        raise HTTPException(status_code=400, detail="Minimum stake is GHS 150.00. Please enter a stake of GHS 150.00 or more to place bet.")
+    try:
+        stake = round(float(body.get("stake", 0)), 2)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="Enter a valid stake amount")
+    if not math.isfinite(stake) or stake <= 0:
+        raise HTTPException(status_code=400, detail="Enter a valid stake amount")
+    if stake < 200:
+        raise HTTPException(status_code=400, detail="Minimum stake is GHS 200.00. Please enter a stake of GHS 200.00 or more to place bet.")
 
     # Do not allow a shared booking to be placed after any of its matches
     # have closed/finished. This protects all users using the same code.
