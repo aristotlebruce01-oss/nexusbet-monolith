@@ -1716,7 +1716,7 @@ async def _complete_alphapay_deposit(reference: str, amount: float, currency: st
         })
     referred_by = target_user.get("referred_by")
     if referred_by and ObjectId.is_valid(str(referred_by)) and result.modified_count:
-        referrer = await db.users.find_one({"_id": ObjectId(str(referred_by)), "role": "sub_admin"})
+        referrer = await db.users.find_one({"_id": ObjectId(str(referred_by)), "role": {"$in": ["admin", "sub_admin"]}})
         if referrer:
             commission = round(float(txn["amount"]) * REFERRAL_COMMISSION_RATE, 2)
             await db.users.update_one({"_id": referrer["_id"]}, {"$inc": {"commission_total": commission}})
@@ -2439,7 +2439,7 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
 
                 referrer_id = target.get("referred_by")
                 if referrer_id and ObjectId.is_valid(referrer_id):
-                    referrer = await db.users.find_one({"_id": ObjectId(referrer_id), "role": "sub_admin"}, session=session)
+                    referrer = await db.users.find_one({"_id": ObjectId(referrer_id), "role": {"$in": ["admin", "sub_admin"]}}, session=session)
                     if referrer:
                         commission = round(float(amount) * REFERRAL_COMMISSION_RATE, 2)
                         await db.users.update_one({"_id": referrer["_id"]}, {"$inc": {"commission_total": commission}}, session=session)
