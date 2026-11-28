@@ -1509,148 +1509,45 @@ async def wallet_payment_methods(user: dict = Depends(get_current_user)):
 
 
 
-ALPHAPAY_BASE_URL = os.getenv("ALPHAPAY_BASE_URL", "https://api.alphapay.me").rstrip("/")
-ALPHAPAY_NETWORKS = {
-    "mtn": "mtn_gh",
-    "telecel": "vodafone_gh",
-    "airteltigo": "tigo_gh",
-}
+OPUSTACK_BASE_URL = os.getenv("OPUSTACK_BASE_URL", "https://opustack-pay-production.up.railway.app").rstrip("/")
+OPUSTACK_NETWORKS = {"mtn": "MTN", "telecel": "TELECEL", "airteltigo": "AT"}
 
 
-async def _alphapay_request(method: str, path: str, payload: Optional[dict] = None, extra_headers: Optional[dict] = None):
-    api_key = os.getenv("ALPHAPAY_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=503, detail="AlphaPay is not configured yet. Please contact support.")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-
-    # Optional static outbound proxy for all AlphaPay HTTP traffic.
-    # requests uses a scheme-to-proxy mapping for its `proxies` argument.
-    # Leave it unset to preserve the existing direct-connection behavior.
-    static_proxy_url = os.getenv("STATIC_PROXY_URL", "").strip()
-    request_proxies = (
-        {"http": static_proxy_url, "https": static_proxy_url}
-        if static_proxy_url else None
-    )
-
+async def _opustack_request(method: str, path: str, payload: Optional[dict] = None):
+    secret = os.getenv("OPUSTACK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="OpusTack Pay is not configured yet. Please contact support.")
+    headers = {"Authorization": f"Bearer {secret}", "Content-Type": "application/json", "Accept": "application/json"}
     def _request():
-        return requests.request(
-            method,
-            f"{ALPHAPAY_BASE_URL}{path}",
-            headers=headers,
-            json=payload,
-            timeout=30,
-            proxies=request_proxies,
-        )
-
+        return requests.request(method, f"{OPUSTACK_BASE_URL}{path}", headers=headers, json=payload, timeout=30)
     try:
         response = await asyncio.to_thread(_request)
-        # Keep the exact response body for diagnostics. Do not log request headers
-        # or API keys. AlphaPay response bodies can contain customer data, so
-        # restrict access to production logs and apply an appropriate retention policy.
-        raw_response_body = response.text or ""
         try:
-            parsed = json.loads(raw_response_body) if raw_response_body else {}
-            data = parsed if isinstance(parsed, dict) else {"response": parsed}
-        except (TypeError, ValueError):
-            data = {"message": raw_response_body}
-        logging.getLogger(__name__).info(
-            "AlphaPay HTTP response method=%s path=%s http_status=%s raw_body=%s",
-            method, path, response.status_code, raw_response_body
-        )
+            body = response.json()
+        except ValueError:
+            body = {}
     except requests.RequestException as exc:
-        logger = logging.getLogger(__name__)
-        logger.exception("AlphaPay network request failed (%s %s)", method, path)
-        raise HTTPException(status_code=502, detail="Could not reach AlphaPay. Please try again.") from exc
-    except Exception as exc:
-        logger = logging.getLogger(__name__)
-        logger.exception("Unexpected AlphaPay request error (%s %s)", method, path)
-        raise HTTPException(status_code=502, detail="Could not reach AlphaPay. Please try again.") from exc
+        logging.getLogger(__name__).exception("OpusTack request failed (%s %s)", method, path)
+        raise HTTPException(status_code=502, detail="Could not reach OpusTack Pay. Please try again.") from exc
+    if response.status_code >= 400 or not isinstance(body, dict) or body.get("status") is False:
+        message = body.get("message") or body.get("error") or "OpusTack Pay rejected the request."
+        logging.getLogger(__name__).warning("OpusTack API rejection status=%s path=%s", response.status_code, path)
+        raise HTTPException(status_code=502, detail=str(message)[:250])
+    return body
 
-    if response.status_code >= 400:
-        message = data.get("message") or data.get("detail") or data.get("error") or "AlphaPay rejected the payment request."
-        code = data.get("code") or data.get("error_code")
-        logger = logging.getLogger(__name__)
-        logger.error("AlphaPay API rejected request: HTTP %s, code=%s, message=%s", response.status_code, str(code or "-"), str(message)[:300])
-        suffix = f" (AlphaPay code: {code})" if code else ""
-        raise HTTPException(status_code=502, detail=f"AlphaPay rejected the request: {str(message)[:300]}{suffix}")
 
-    if isinstance(data, dict):
-        result_meta = data.get("result") if isinstance(data.get("result"), dict) else {}
-        if data.get("success") is False or str(result_meta.get("resultStatus", "")).upper() == "F":
-            message = result_meta.get("resultMessage") or data.get("message") or "AlphaPay rejected the payment request."
-            logger = logging.getLogger(__name__)
-            logger.error("AlphaPay business rejection: %s", str(message)[:300])
-            raise HTTPException(status_code=502, detail=f"AlphaPay rejected the request: {str(message)[:300]}")
+def _opustack_data(payload: dict) -> dict:
+    data = payload.get("data")
     return data if isinstance(data, dict) else {}
 
 
-# AlphaPay payout API. Set ALPHAPAY_BASE_URL to the provider's sandbox base URL
-# when testing; production defaults to https://api.alphapay.me.
-ALPHAPAY_PAYOUT_INITIALIZE_PATH = os.getenv(
-    "ALPHAPAY_PAYOUT_INITIALIZE_PATH", "/api/v1/payouts/initialize"
-)
-ALPHAPAY_PAYOUT_STATUS_PATH = os.getenv(
-    "ALPHAPAY_PAYOUT_STATUS_PATH", "/api/v1/payouts/{payout_id}"
-)
-
-
-async def trigger_alphapay_payout(payload: dict, idempotency_key: str) -> dict:
-    """Create one AlphaPay payout using the shared requests+STATIC_PROXY_URL helper."""
-    try:
-        parsed_key = uuid.UUID(str(idempotency_key))
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise HTTPException(status_code=400, detail="A valid UUID idempotency key is required") from exc
-    if not isinstance(payload, dict) or not payload:
-        raise HTTPException(status_code=400, detail="A valid payout payload is required")
-    return await _alphapay_request(
-        "POST", ALPHAPAY_PAYOUT_INITIALIZE_PATH, payload,
-        extra_headers={"Idempotency-Key": str(parsed_key)},
-    )
-
-
-async def get_alphapay_payout_status(payout_id: str) -> dict:
-    payout_id = str(payout_id or "").strip()
-    if not payout_id:
-        raise HTTPException(status_code=400, detail="AlphaPay payout ID is required")
-    path = ALPHAPAY_PAYOUT_STATUS_PATH.format(payout_id=quote(payout_id, safe=""))
-    return await _alphapay_request("GET", path)
-
-
-def _alphapay_payload_data(payload: dict) -> dict:
-    value = payload.get("data")
-    return value if isinstance(value, dict) else payload
-
-
-def _alphapay_state(payload: dict) -> str:
-    data = _alphapay_payload_data(payload)
-    return str(
-        data.get("status")
-        or data.get("payment_status")
-        or payload.get("status")
-        or payload.get("payment_status")
-        or ""
-    ).strip().lower()
-
-
-async def _complete_alphapay_deposit(reference: str, amount: float, currency: str = "GHS"):
-    txn = await db.transactions.find_one({
-        "type": "deposit", "gateway": "alphapay",
-        "$or": [
-            {"gateway_reference": reference},
-            {"alphapay_reference": reference},
-            {"reference": reference},
-        ],
-    })
-    if not txn or currency.upper() != "GHS":
+async def _complete_opustack_deposit(reference: str, amount_minor: int, currency: str = "GHS"):
+    txn = await db.transactions.find_one({"type": "deposit", "gateway": "opustack", "gateway_reference": reference})
+    if not txn or str(currency).upper() != "GHS":
         return False
-    if not math.isclose(float(txn.get("amount", 0)), float(amount), rel_tol=0, abs_tol=0.01):
+    expected_minor = int(round(float(txn.get("amount", 0)) * 100))
+    if int(amount_minor) != expected_minor:
+        logging.getLogger(__name__).warning("OpusTack amount mismatch for deposit transaction %s", txn.get("id"))
         return False
     if txn.get("credited") or txn.get("status") == "credited":
         return True
@@ -1672,66 +1569,32 @@ async def _complete_alphapay_deposit(reference: str, amount: float, currency: st
         return False
     bonus_cap = float((await get_settings()).get("first_deposit_bonus_cap", FIRST_DEPOSIT_BONUS_CAP))
     bonus = min(float(txn["amount"]), bonus_cap) if not target_user.get("first_deposit_bonus_awarded", False) else 0.0
-    base_update = {
-        "$inc": {"balance": float(txn["amount"]), "total_deposited": float(txn["amount"])},
-        "$addToSet": {"credited_deposit_ids": txn["id"]},
-    }
+    base_update = {"$inc": {"balance": float(txn["amount"]), "total_deposited": float(txn["amount"])}, "$addToSet": {"credited_deposit_ids": txn["id"]}}
     if bonus:
-        bonus_update = {
-            "$inc": {"balance": float(txn["amount"]) + bonus, "total_deposited": float(txn["amount"])},
-            "$set": {"first_deposit_bonus_awarded": True},
-            "$addToSet": {"credited_deposit_ids": txn["id"]},
-        }
-        result = await db.users.update_one(
-            {"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}, "first_deposit_bonus_awarded": {"$ne": True}},
-            bonus_update,
-        )
+        bonus_update = {"$inc": {"balance": float(txn["amount"]) + bonus, "total_deposited": float(txn["amount"])}, "$set": {"first_deposit_bonus_awarded": True}, "$addToSet": {"credited_deposit_ids": txn["id"]}}
+        result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}, "first_deposit_bonus_awarded": {"$ne": True}}, bonus_update)
         if not result.modified_count:
             bonus = 0.0
-            result = await db.users.update_one(
-                {"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update
-            )
+            result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update)
     else:
-        result = await db.users.update_one(
-            {"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update
-        )
+        result = await db.users.update_one({"_id": user_id, "credited_deposit_ids": {"$ne": txn["id"]}}, base_update)
     if not result.modified_count:
-        already_credited = await db.users.find_one(
-            {"_id": user_id, "credited_deposit_ids": txn["id"]}, {"_id": 1}
-        )
+        already_credited = await db.users.find_one({"_id": user_id, "credited_deposit_ids": txn["id"]}, {"_id": 1})
         if not already_credited:
             return False
         bonus = 0.0
     now = datetime.now(timezone.utc).isoformat()
-    await db.transactions.update_one(
-        {"id": txn["id"], "status": "processing"},
-        {"$set": {"status": "credited", "credited": True, "credited_at": now, "bonus_amount": round(bonus, 2)}},
-    )
+    await db.transactions.update_one({"id": txn["id"], "status": "processing"}, {"$set": {"status": "credited", "credited": True, "credited_at": now, "bonus_amount": round(bonus, 2)}})
     if bonus:
-        await db.transactions.insert_one({
-            "id": str(uuid.uuid4()), "reference": f"NB-B-{uuid.uuid4().hex[:10].upper()}",
-            "user_id": txn["user_id"], "type": "first_deposit_bonus", "amount": round(bonus, 2),
-            "method": "promotion", "status": "credited", "deposit_reference": txn.get("reference"),
-            "created_at": now, "promotion": "100% first deposit bonus up to GHS 100",
-        })
+        await db.transactions.insert_one({"id": str(uuid.uuid4()), "reference": f"NB-B-{uuid.uuid4().hex[:10].upper()}", "user_id": txn["user_id"], "type": "first_deposit_bonus", "amount": round(bonus, 2), "method": "promotion", "status": "credited", "deposit_reference": txn.get("reference"), "created_at": now, "promotion": "100% first deposit bonus up to GHS 100"})
     referred_by = target_user.get("referred_by")
     if referred_by and ObjectId.is_valid(str(referred_by)) and result.modified_count:
         referrer = await db.users.find_one({"_id": ObjectId(str(referred_by)), "role": {"$in": ["admin", "sub_admin"]}})
         if referrer:
             commission = round(float(txn["amount"]) * REFERRAL_COMMISSION_RATE, 2)
             await db.users.update_one({"_id": referrer["_id"]}, {"$inc": {"commission_total": commission}})
-            await db.transactions.insert_one({
-                "id": str(uuid.uuid4()), "reference": f"NB-C-{uuid.uuid4().hex[:10].upper()}",
-                "user_id": str(referrer["_id"]), "type": "referral_commission", "amount": commission,
-                "deposit_amount": float(txn["amount"]), "referred_user_id": txn["user_id"],
-                "method": "referral", "status": "earned", "commission_rate": REFERRAL_COMMISSION_RATE,
-                "created_at": now, "deposit_reference": txn.get("reference"),
-            })
-    await db.audit_logs.insert_one({
-        "type": "deposit", "action": "automatically_credited", "deposit_id": txn["id"],
-        "user_id": txn["user_id"], "amount": txn["amount"], "method": txn["method"],
-        "gateway": "alphapay", "gateway_reference": reference, "bonus_amount": round(bonus, 2), "at": now,
-    })
+            await db.transactions.insert_one({"id": str(uuid.uuid4()), "reference": f"NB-C-{uuid.uuid4().hex[:10].upper()}", "user_id": str(referrer["_id"]), "type": "referral_commission", "amount": commission, "deposit_amount": float(txn["amount"]), "referred_user_id": txn["user_id"], "method": "referral", "status": "earned", "commission_rate": REFERRAL_COMMISSION_RATE, "created_at": now, "deposit_reference": txn.get("reference")})
+    await db.audit_logs.insert_one({"type": "deposit", "action": "automatically_credited", "deposit_id": txn["id"], "user_id": txn["user_id"], "amount": txn["amount"], "method": txn["method"], "gateway": "opustack", "gateway_reference": reference, "bonus_amount": round(bonus, 2), "at": now})
     return True
 
 
@@ -1749,311 +1612,107 @@ async def deposit(body: DepositInput, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Add a valid email address to your account before depositing.")
     phone = re.sub(r"[^0-9]", "", body.phone_number)
     if phone.startswith("0") and len(phone) == 10:
-        phone = "233" + phone[1:]
+        local_phone = phone
+        international_phone = "+233" + phone[1:]
     elif phone.startswith("233") and len(phone) == 12:
-        pass
+        local_phone = "0" + phone[3:]
+        international_phone = "+" + phone
     else:
         raise HTTPException(status_code=400, detail="Enter a valid Ghana mobile number, e.g. 0241234567.")
     internal_id = str(uuid.uuid4())
-    reference = f"NB-D-{uuid.uuid4().hex[:12].upper()}"
+    merchant_reference = f"NB-D-{uuid.uuid4().hex[:12].upper()}"
     now = datetime.now(timezone.utc).isoformat()
-    await db.transactions.insert_one({
-        "id": internal_id, "reference": reference, "user_id": str(user["_id"]),
-        "type": "deposit", "amount": round(body.amount, 2), "method": body.method,
-        "phone_number": phone, "status": "initiating", "credited": False,
-        "gateway": "alphapay", "created_at": now,
-    })
-    # AlphaPay's current Softpay contract requires amount as a decimal string,
-    # a description, and a customer object. The returned AlphaPay `id` is the
-    # UUID required by the payment-verification endpoint.
-    full_name = str(user.get("name") or user.get("full_name") or "NexusBet customer").strip()
-    name_parts = full_name.split()
-    first_name = name_parts[0] if name_parts else "NexusBet"
-    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "Customer"
-    payload = {
-        "amount": f"{body.amount:.2f}",
-        "currency": "GHS",
-        "country": "GH",
-        "description": f"NexusBet wallet deposit {reference}",
-        "customer": {
-            "phone": f"+{phone}",
-            "email": user["email"],
-            "first_name": first_name,
-            "last_name": last_name,
-        },
-        "network": ALPHAPAY_NETWORKS[body.method],
-        "metadata": {"nexusbet_reference": reference},
-    }
-    # Structured outbound diagnostics: never include authorization headers, API
-    # keys, full MSISDNs, or other secrets in this record.
-    softpay_path = "/api/v1/payments/softpay/"
-    outbound_phone = str(payload.get("customer", {}).get("phone", ""))
-    if outbound_phone.startswith("+233"):
-        phone_format = "+233"
-        phone_prefix = "+233"
-    elif outbound_phone.startswith("233"):
-        phone_format = "233"
-        phone_prefix = "233"
-    elif outbound_phone.startswith("0"):
-        phone_format = "0"
-        phone_prefix = "0"
-    else:
-        phone_format = "other"
-        phone_prefix = outbound_phone[:2]
-    phone_digits = re.sub(r"\D", "", outbound_phone)
-    masked_phone = (
-        f"{phone_prefix}{'*' * max(0, len(outbound_phone) - len(phone_prefix) - 2)}{outbound_phone[-2:]}"
-        if outbound_phone else ""
-    )
-    outbound_metadata = payload.get("metadata")
-    outbound_reference = (
-        outbound_metadata.get("nexusbet_reference")
-        if isinstance(outbound_metadata, dict) else None
-    )
-    outbound_diagnostic = {
-        "event": "alphapay_softpay_outbound",
-        "method": "POST",
-        "target_path": softpay_path,
-        "network": payload.get("network"),
-        "phone": {
-            "format_prefix": phone_format,
-            "masked": masked_phone,
-            "character_length": len(outbound_phone),
-            "digit_count": len(phone_digits),
-        },
-        "payload_schema": {
-            "amount": {"type": type(payload.get("amount")).__name__},
-            "metadata": {
-                "type": type(outbound_metadata).__name__,
-                "keys": sorted(outbound_metadata.keys()) if isinstance(outbound_metadata, dict) else [],
-            },
-            "reference": {
-                "type": type(outbound_reference).__name__ if outbound_reference is not None else "NoneType",
-                "source": "metadata.nexusbet_reference",
-            },
-        },
-    }
-    logging.getLogger(__name__).info(
-        "AlphaPay outbound diagnostic %s",
-        json.dumps(outbound_diagnostic, sort_keys=True, separators=(",", ":")),
-    )
-
+    await db.transactions.insert_one({"id": internal_id, "reference": merchant_reference, "user_id": str(user["_id"]), "type": "deposit", "amount": round(body.amount, 2), "method": body.method, "phone_number": local_phone, "status": "initiating", "credited": False, "gateway": "opustack", "created_at": now})
+    payload = {"email": str(user["email"]).lower(), "amount": int(round(float(body.amount) * 100)), "currency": "GHS", "phone": international_phone, "network": OPUSTACK_NETWORKS[body.method], "reference": merchant_reference, "metadata": {"nexusbet_transaction_id": internal_id, "nexusbet_reference": merchant_reference}}
     try:
-        result = await _alphapay_request(
-            "POST",
-            softpay_path,
-            payload,
-            extra_headers={"Idempotency-Key": internal_id},
-        )
+        result = await _opustack_request("POST", "/v1/charge", payload)
     except HTTPException:
-        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed"}})
+        await db.transactions.update_one({"id": internal_id, "status": "initiating"}, {"$set": {"status": "failed", "provider_status": "initialization_failed"}})
         raise
+    data = _opustack_data(result)
+    provider_reference = str(data.get("reference") or "").strip()
+    state = str(data.get("status") or "pending").lower()
+    if not provider_reference:
+        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed", "provider_status": "missing_reference"}})
+        raise HTTPException(status_code=502, detail="OpusTack Pay did not return a payment reference. Please contact support before retrying.")
+    if state in ("failed", "failure", "declined", "rejected"):
+        await db.transactions.update_one({"id": internal_id}, {"$set": {"gateway_reference": provider_reference, "status": "failed", "provider_status": state}})
+        raise HTTPException(status_code=502, detail="OpusTack Pay could not initiate this payment.")
+    await db.transactions.update_one({"id": internal_id}, {"$set": {"gateway_reference": provider_reference, "status": "pending", "provider_status": state, "gateway_next_action": data.get("next_action")}})
+    return {"id": internal_id, "reference": provider_reference, "merchant_reference": merchant_reference, "status": state, "next_action": data.get("next_action"), "requires_otp": data.get("next_action") == "submit_otp", "message": result.get("message") or "Approve the Moolre Mobile Money prompt on your phone."}
 
-    data = _alphapay_payload_data(result)
-    provider_id = str(data.get("id") or data.get("payment_id") or "").strip()
-    state = _alphapay_state(result) or "pending"
-    checkout_url = data.get("checkout_url") or data.get("payment_url") or ""
-    if not provider_id:
-        logging.getLogger(__name__).error("AlphaPay softpay response did not contain a payment id; response keys=%s", sorted(data.keys()))
-        await db.transactions.update_one({"id": internal_id}, {"$set": {"status": "failed", "provider_status": "missing_payment_id"}})
-        raise HTTPException(status_code=502, detail="AlphaPay response did not include a payment reference. Please contact support before retrying.")
-    if state in ("failed", "failure", "cancelled", "canceled", "rejected", "expired"):
-        await db.transactions.update_one(
-            {"id": internal_id}, {"$set": {"gateway_reference": provider_id, "alphapay_reference": reference, "status": "failed", "provider_status": state}}
-        )
-        raise HTTPException(status_code=502, detail=str(data.get("message") or "AlphaPay could not initiate this payment."))
-    await db.transactions.update_one(
-        {"id": internal_id},
-        {"$set": {
-            "gateway_reference": provider_id,
-            "alphapay_reference": reference,
-            "gateway_checkout_url": checkout_url,
-            "status": "pending",
-            "provider_status": state,
-        }},
-    )
-    return {
-        "id": internal_id,
-        "reference": provider_id,
-        "merchant_reference": reference,
-        "status": state,
-        "checkout_url": checkout_url,
-        "message": data.get("message") or "Approve the payment prompt on your mobile money phone. If a secure checkout link is provided, open it to complete payment.",
-    }
+
+@router.post("/wallet/deposit/otp")
+async def submit_wallet_deposit_otp(body: dict, user: dict = Depends(get_current_user)):
+    reference = str(body.get("reference") or "").strip()
+    otp = str(body.get("otp") or "").strip()
+    if not reference or not otp or len(otp) > 12:
+        raise HTTPException(status_code=400, detail="Enter the verification code sent to your phone.")
+    txn = await db.transactions.find_one({"type": "deposit", "gateway": "opustack", "gateway_reference": reference, "user_id": str(user["_id"]), "status": "pending"})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Pending OpusTack deposit not found.")
+    result = await _opustack_request("POST", "/v1/charge/submit_otp", {"reference": reference, "otp": otp})
+    data = _opustack_data(result)
+    return {"status": str(data.get("status") or "pending").lower(), "message": result.get("message") or "Verification code submitted. Approve the payment prompt if requested, then check payment status."}
 
 
 @router.get("/wallet/deposit/verify/{reference}")
 async def verify_wallet_deposit(reference: str, user: dict = Depends(get_current_user)):
-    txn = await db.transactions.find_one({
-        "type": "deposit", "gateway": "alphapay", "gateway_reference": reference,
-        "user_id": str(user["_id"]),
-    })
+    txn = await db.transactions.find_one({"type": "deposit", "gateway": "opustack", "gateway_reference": reference, "user_id": str(user["_id"])})
     if not txn:
         raise HTTPException(status_code=404, detail="Deposit reference not found.")
     if txn.get("credited"):
         return {"status": "credited", "message": "Payment confirmed and wallet credited."}
-    verify_path = f"/api/v1/payments/{quote(reference, safe='')}/verify/"
-    result = await _alphapay_request("GET", verify_path)
-    data = _alphapay_payload_data(result)
-    state = _alphapay_state(result)
-    if state in ("success", "successful", "succeeded", "completed", "paid"):
-        paid_amount = data.get("requested_amount", data.get("amount", data.get("paid_amount", txn["amount"])))
-        currency = data.get("currency", "GHS")
+    result = await _opustack_request("GET", f"/v1/transactions/verify/{quote(reference, safe='')}")
+    data = _opustack_data(result)
+    state = str(data.get("status") or "pending").lower()
+    if state == "success":
         try:
-            paid_amount = float(paid_amount)
+            paid_amount = int(data.get("amount"))
         except (TypeError, ValueError):
             paid_amount = -1
-        if await _complete_alphapay_deposit(reference, paid_amount, str(currency)):
+        if await _complete_opustack_deposit(reference, paid_amount, str(data.get("currency") or "GHS")):
             return {"status": "credited", "message": "Payment confirmed and wallet credited."}
-    if state in ("failed", "failure", "abandoned", "cancelled", "canceled", "rejected", "expired"):
-        await db.transactions.update_one(
-            {"id": txn["id"], "status": "pending"},
-            {"$set": {"status": "failed", "provider_status": state}},
-        )
-        return {"status": "failed", "message": "The mobile money payment was not completed."}
-    return {"status": "pending", "message": "Payment is still awaiting mobile money confirmation."}
+        raise HTTPException(status_code=409, detail="Payment verification amount or currency did not match this deposit. Contact support.")
+    if state in ("failed", "reversed"):
+        await db.transactions.update_one({"id": txn["id"], "status": "pending"}, {"$set": {"status": "failed", "provider_status": state}})
+        return {"status": "failed", "message": "The Mobile Money payment was not completed."}
+    return {"status": "pending", "message": "Payment is still pending. Approve the Moolre prompt on your phone; it is not paid yet."}
 
 
-@router.post("/payments/alphapay/webhook")
-async def alphapay_webhook(request: Request):
-    secret = os.getenv("ALPHAPAY_WEBHOOK_SECRET", "").strip()
+@router.post("/payments/opustack/webhook")
+async def opustack_webhook(request: Request):
+    secret = os.getenv("OPUSTACK_SECRET", "").strip()
     if not secret:
-        raise HTTPException(status_code=503, detail="AlphaPay webhook is not configured")
+        raise HTTPException(status_code=503, detail="OpusTack webhook is not configured")
     raw = await request.body()
-    signature = request.headers.get("x-webhook-signature", "")
-    timestamp = request.headers.get("x-webhook-timestamp", "")
-    if not signature or not timestamp:
-        raise HTTPException(status_code=401, detail="Missing AlphaPay webhook signature")
-    try:
-        # AlphaPay sends X-Webhook-Timestamp as a Unix timestamp in seconds.
-        sent_at_seconds = int(timestamp)
-        if abs(datetime.now(timezone.utc).timestamp() - sent_at_seconds) > 300:
-            raise HTTPException(status_code=401, detail="Expired AlphaPay webhook")
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid AlphaPay webhook timestamp")
-    expected = hmac.new(secret.encode(), timestamp.encode() + b"." + raw, hashlib.sha256).hexdigest()
+    signature = request.headers.get("x-opustack-signature", "").strip().lower()
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing OpusTack webhook signature")
+    expected = hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest()
     if not hmac.compare_digest(signature, expected):
-        raise HTTPException(status_code=401, detail="Invalid AlphaPay webhook signature")
+        raise HTTPException(status_code=401, detail="Invalid OpusTack webhook signature")
     try:
         event = json.loads(raw.decode("utf-8"))
-        if not isinstance(event, dict):
-            raise ValueError("Webhook JSON root must be an object")
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "AlphaPay webhook received a validly signed but invalid JSON body; byte_length=%s",
-            len(raw),
-        )
+        if not isinstance(event, dict): raise ValueError("Expected object")
+    except (ValueError, UnicodeDecodeError):
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
-    # Log only after signature and timestamp verification. This captures the
-    # exact provider event for reconciliation; protect logs because event data
-    # may include customer identifiers. Never log the webhook signature/secret.
-    logging.getLogger(__name__).info(
-        "AlphaPay verified webhook received raw_body=%s", raw.decode("utf-8", errors="replace")
-    )
     event_name = str(event.get("event") or "").lower()
-    data = event.get("data") if isinstance(event.get("data"), dict) else event
-    reference = str(data.get("id") or data.get("reference") or data.get("merchant_reference") or "")
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    reference = str(data.get("reference") or "").strip()
     state = str(data.get("status") or "").lower()
-    if event_name in ("transaction.success", "payment.success", "payment.succeeded") or state in ("success", "successful", "succeeded", "completed", "paid"):
-        try:
-            amount = float(data.get("amount", data.get("paid_amount", 0)))
-        except (TypeError, ValueError):
-            amount = 0
-        await _complete_alphapay_deposit(reference, amount, str(data.get("currency") or "GHS"))
-    elif event_name in ("transaction.failed", "transaction.cancelled", "payment.failed", "payment.cancelled") or state in ("failed", "cancelled", "canceled", "rejected", "expired"):
-        await db.transactions.update_one(
-            {
-                "type": "deposit", "gateway": "alphapay", "status": "pending",
-                "$or": [
-                    {"gateway_reference": reference},
-                    {"alphapay_reference": reference},
-                    {"reference": reference},
-                ],
-            },
-            {"$set": {"status": "failed", "provider_status": state or event_name}},
-        )
+    if event_name == "charge.success" or state == "success":
+        try: amount_minor = int(data.get("amount"))
+        except (TypeError, ValueError): amount_minor = -1
+        await _complete_opustack_deposit(reference, amount_minor, str(data.get("currency") or "GHS"))
+    elif event_name == "charge.failed" or state in ("failed", "reversed"):
+        await db.transactions.update_one({"type": "deposit", "gateway": "opustack", "gateway_reference": reference, "status": "pending"}, {"$set": {"status": "failed", "provider_status": state or event_name}})
     return {"received": True}
 
 
 @router.post("/wallet/deposit/manual")
 async def legacy_manual_deposit_rejected(request: Request):
     raise HTTPException(status_code=410, detail="Manual deposits are disabled. Use the automatic mobile money checkout.")
-
-
-def _alphapay_payout_state(payload: dict) -> str:
-    data = _alphapay_payload_data(payload)
-    return str(
-        data.get("status") or data.get("payout_status") or data.get("transaction_status")
-        or payload.get("status") or "pending"
-    ).strip().lower()
-
-
-async def _apply_alphapay_payout_status(txn: dict, provider_payload: dict, reviewed_by: str = "system") -> dict:
-    """Persist a provider status exactly once; failed payouts refund the reserved wallet amount."""
-    data = _alphapay_payload_data(provider_payload)
-    provider_state = _alphapay_payout_state(provider_payload)
-    provider_id = str(
-        data.get("id") or data.get("payout_id") or data.get("payoutId")
-        or data.get("transaction_id") or txn.get("payout_id") or ""
-    ).strip()
-    now = datetime.now(timezone.utc).isoformat()
-    success_states = {"success", "successful", "succeeded", "completed", "paid"}
-    failure_states = {"failed", "failure", "rejected", "cancelled", "canceled", "declined", "expired"}
-
-    if provider_state in success_states:
-        update = await db.transactions.update_one(
-            {"id": txn["id"], "type": "withdrawal", "status": "processing", "payout_status": {"$ne": "success"}},
-            {"$set": {"status": "paid", "payout_status": "success", "provider_status": provider_state,
-                      "payout_id": provider_id or txn.get("payout_id"), "paid_at": now,
-                      "payout_response": provider_payload, "reviewed_by": reviewed_by}},
-        )
-        fresh = await db.transactions.find_one({"id": txn["id"]})
-        return {"status": fresh.get("status", "processing"), "payout_status": fresh.get("payout_status", provider_state),
-                "payout_id": fresh.get("payout_id"), "provider": data}
-
-    if provider_state in failure_states:
-        session = await client.start_session()
-        try:
-            async with session.start_transaction():
-                fresh = await db.transactions.find_one(
-                    {"id": txn["id"], "type": "withdrawal", "status": "processing", "refunded": {"$ne": True}},
-                    session=session,
-                )
-                if fresh:
-                    changed = await db.transactions.update_one(
-                        {"id": txn["id"], "status": "processing", "refunded": {"$ne": True}},
-                        {"$set": {"status": "failed", "payout_status": "failed", "provider_status": provider_state,
-                                  "payout_id": provider_id or txn.get("payout_id"), "payout_response": provider_payload,
-                                  "payout_failed_at": now, "refunded": True}},
-                        session=session,
-                    )
-                    if changed.modified_count == 1:
-                        await db.users.update_one(
-                            {"_id": ObjectId(fresh["user_id"])},
-                            {"$inc": {"balance": round(float(fresh["amount"]), 2)}},
-                            session=session,
-                        )
-                        await db.audit_logs.insert_one({
-                            "type": "withdrawal", "action": "alphapay_payout_failed_refunded",
-                            "transaction_id": txn["id"], "user_id": fresh["user_id"],
-                            "amount": fresh["amount"], "provider_status": provider_state, "at": now,
-                        }, session=session)
-        finally:
-            await session.end_session()
-        fresh = await db.transactions.find_one({"id": txn["id"]})
-        return {"status": fresh.get("status", "failed"), "payout_status": fresh.get("payout_status", "failed"),
-                "payout_id": fresh.get("payout_id"), "provider": data}
-
-    # PENDING / PROCESSING / INITIATED / UNKNOWN remain reserved and are never marked paid.
-    await db.transactions.update_one(
-        {"id": txn["id"], "type": "withdrawal", "status": "processing"},
-        {"$set": {"payout_status": provider_state or "pending", "provider_status": provider_state or "pending",
-                  "payout_id": provider_id or txn.get("payout_id"), "payout_response": provider_payload,
-                  "payout_last_checked_at": now}},
-    )
-    fresh = await db.transactions.find_one({"id": txn["id"]})
-    return {"status": fresh.get("status", "processing"), "payout_status": fresh.get("payout_status", provider_state),
-            "payout_id": fresh.get("payout_id"), "provider": data}
 
 
 @router.post("/wallet/withdraw")
@@ -2368,7 +2027,7 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
     if txn.get("type") not in ("deposit", "withdrawal"):
         raise HTTPException(status_code=400, detail="This transaction type cannot be reviewed here")
     if txn.get("type") == "deposit":
-        raise HTTPException(status_code=409, detail="Deposits are verified and credited automatically by AlphaPay. Manual deposit review is disabled.")
+        raise HTTPException(status_code=409, detail="Deposits are verified and credited automatically by OpusTack Pay. Manual deposit review is disabled.")
     # Withdrawal approvals/rejections must start from PENDING only. PROCESSING
     # means a provider request may already be in flight; never issue another payout.
     if txn.get("status") != "pending":
@@ -2450,70 +2109,19 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
             await session.end_session()
         return {"ok": True, "status": "approved", "credited_amount": round(float(amount) + bonus_amount, 2), "bonus_amount": round(bonus_amount, 2)}
 
-    # Withdrawal review flow: claim PENDING -> PROCESSING atomically before
-    # contacting AlphaPay. A second admin click cannot pass this compare-and-set.
+    # OpusTack payouts are requested from the OpusTack dashboard, not via a documented payout API.
+    # Admin approval records the manual settlement workflow; it does not send a provider payout.
     if action == "approve":
-        idempotency_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"nexusbet:alphapay:payout:{transaction_id}"))
-        # Validate local payout details before claiming the transaction, so a
-        # malformed phone/network does not leave a withdrawal stuck PROCESSING.
-        phone_raw = str(txn.get("phone_number") or txn.get("destination") or "").strip()
-        phone_digits = re.sub(r"\D", "", phone_raw)
-        if phone_digits.startswith("0") and len(phone_digits) == 10:
-            phone_digits = "233" + phone_digits[1:]
-        if not (phone_digits.startswith("233") and len(phone_digits) == 12):
-            raise HTTPException(status_code=400, detail="Withdrawal has an invalid Ghana mobile number; payout was not sent")
-        network = ALPHAPAY_NETWORKS.get(str(txn.get("method") or "mtn").lower())
-        if not network:
-            raise HTTPException(status_code=400, detail="Unsupported AlphaPay payout network; payout was not sent")
-        claimed = await db.transactions.find_one_and_update(
+        result = await db.transactions.update_one(
             {"id": transaction_id, "type": "withdrawal", "status": "pending"},
-            {"$set": {"status": "processing", "payout_status": "initiating",
-                      "payout_idempotency_key": idempotency_key, "reviewed_at": reviewed_at,
-                      "reviewed_by": str(staff["_id"]), "review_reason": reason},
+            {"$set": {"status": "approved", "payout_status": "manual_settlement_required",
+                      "reviewed_at": reviewed_at, "reviewed_by": str(staff["_id"]), "review_reason": reason},
              "$push": {"audit_history": audit_entry}},
-            return_document=ReturnDocument.AFTER,
         )
-        if not claimed:
-            raise HTTPException(status_code=409, detail="Withdrawal is already processing or has been reviewed")
-
-        payout_phone = "+" + phone_digits
-        payout_user = await db.users.find_one({"_id": ObjectId(user_id)})
-        full_name = str((payout_user or {}).get("name") or (payout_user or {}).get("full_name") or "NexusBet customer").strip()
-        name_parts = full_name.split()
-        payout_payload = {
-            "amount": f"{float(amount):.2f}",
-            "currency": "GHS",
-            "country": "GH",
-            "method": network,
-            # Match AlphaPay's customer object shape already used by NexusBet's
-            # AlphaPay mobile-money deposit integration.
-            "customer": {
-                "phone": payout_phone,
-                "first_name": name_parts[0] if name_parts else "NexusBet",
-                "last_name": " ".join(name_parts[1:]) if len(name_parts) > 1 else "Customer",
-                "email": (payout_user or {}).get("email"),
-            },
-        }
-        # Do not release funds on timeout/unknown response: AlphaPay may have
-        # accepted the payout. Reconcile using the status endpoint and same key.
-        try:
-            provider_result = await trigger_alphapay_payout(payout_payload, idempotency_key)
-        except HTTPException as exc:
-            await db.transactions.update_one(
-                {"id": transaction_id, "status": "processing"},
-                {"$set": {"payout_status": "unknown", "payout_error": str(exc.detail),
-                          "payout_idempotency_key": idempotency_key}},
-            )
-            raise HTTPException(status_code=502, detail="AlphaPay payout outcome is not confirmed. The withdrawal remains processing; check payout status before retrying.") from exc
-
-        result = await _apply_alphapay_payout_status(claimed, provider_result, str(staff["_id"]))
-        await db.audit_logs.insert_one({
-            "type": "withdrawal", "action": "alphapay_payout_initialized",
-            "transaction_id": transaction_id, "user_id": user_id, "amount": float(amount),
-            "reviewed_by": str(staff["_id"]), "payout_id": result.get("payout_id"),
-            "payout_status": result.get("payout_status"), "at": datetime.now(timezone.utc).isoformat(),
-        })
-        return {"ok": True, **result, "message": "AlphaPay payout request submitted; final status may require confirmation."}
+        if result.modified_count != 1:
+            raise HTTPException(status_code=409, detail="Withdrawal was already reviewed")
+        await db.audit_logs.insert_one({"type": "withdrawal", "action": "approved_for_manual_settlement", "transaction_id": transaction_id, "user_id": user_id, "amount": float(amount), "reviewed_by": str(staff["_id"]), "at": reviewed_at})
+        return {"ok": True, "status": "approved", "payout_status": "manual_settlement_required", "message": "Withdrawal approved. Complete the payout through your configured settlement account or OpusTack dashboard, then record it as paid."}
 
     result = await db.transactions.update_one(
         {"id": transaction_id, "type": "withdrawal", "status": "pending"},
@@ -2526,20 +2134,21 @@ async def review_transaction(transaction_id: str, action: Literal["approve", "re
     return {"ok": True, "status": "rejected"}
 
 
-@router.get("/admin/transactions/{transaction_id}/payout-status")
-async def refresh_alphapay_payout_status(transaction_id: str, staff: dict = Depends(require_admin)):
-    txn = await db.transactions.find_one({"id": transaction_id, "type": "withdrawal"})
+@router.post("/admin/transactions/{transaction_id}/mark-paid")
+async def mark_manual_withdrawal_paid(transaction_id: str, staff: dict = Depends(require_admin)):
+    now = datetime.now(timezone.utc).isoformat()
+    txn = await db.transactions.find_one_and_update(
+        {"id": transaction_id, "type": "withdrawal", "status": "approved", "payout_status": "manual_settlement_required"},
+        {"$set": {"status": "paid", "payout_status": "manual_settlement_paid", "paid_at": now,
+                  "marked_paid_by": str(staff["_id"])}},
+        return_document=ReturnDocument.AFTER,
+    )
     if not txn:
-        raise HTTPException(status_code=404, detail="Withdrawal transaction not found")
-    if txn.get("status") in ("paid", "failed", "rejected"):
-        return {"ok": True, "status": txn.get("status"), "payout_status": txn.get("payout_status"),
-                "payout_id": txn.get("payout_id"), "message": "Withdrawal already has a final status."}
-    payout_id = txn.get("payout_id")
-    if not payout_id:
-        raise HTTPException(status_code=409, detail="AlphaPay has not returned a payout ID yet. Keep this withdrawal processing and contact AlphaPay if the request timed out.")
-    provider_result = await get_alphapay_payout_status(payout_id)
-    result = await _apply_alphapay_payout_status(txn, provider_result, str(staff["_id"]))
-    return {"ok": True, **result}
+        raise HTTPException(status_code=409, detail="Only an approved manual-settlement withdrawal can be marked paid.")
+    await db.audit_logs.insert_one({"type": "withdrawal", "action": "manual_settlement_marked_paid", "transaction_id": transaction_id,
+                                   "user_id": txn.get("user_id"), "amount": txn.get("amount"),
+                                   "marked_paid_by": str(staff["_id"]), "at": now})
+    return {"ok": True, "status": "paid", "payout_status": "manual_settlement_paid"}
 
 
 @router.get("/admin/users")
